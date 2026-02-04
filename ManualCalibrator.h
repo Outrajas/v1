@@ -1,0 +1,48 @@
+#ifndef MANUAL_CALIBRATOR_H
+#define MANUAL_CALIBRATOR_H
+
+#include <opencv2/opencv.hpp>
+#include <vector>
+#include <string>
+#include "FingerAnalyzer.h"
+
+class EnhancedManualCalibrator {
+private:
+    cv::Mat calibrationFrame;
+    cv::Mat calibrationFrameHSV;
+    
+    int calibrationStep = 0;
+    bool isActive = false;
+    bool isDrawing = false;
+    
+    cv::Point hsvRectStart;
+    cv::Rect hsvSamplingRect;
+    std::vector<cv::Point> palmTrace;
+    
+    cv::Point2f thumbBase;
+    cv::Point2f pinkyBase;
+    cv::Point2f wristLeft;
+    cv::Point2f wristRight;
+    
+    cv::Point2f fingerTips[5];
+    cv::Point2f fingerBases[5];
+    bool fingerTipsMarked[5] = {false};
+    bool fingerBasesMarked[5] = {false};
+    bool wristLeftMarked = false;
+    bool wristRightMarked = false;
+    
+    std::string fingerNames[5] = {"Thumb", "Index", "Middle", "Ring", "Pinky"};
+    
+public:
+    void startCalibration(const cv::Mat& frame);
+    void handleMouse(int event, int x, int y);
+    bool validateStep(int step) const;
+    void drawStepUI(cv::Mat& frame);
+    bool processCalibration(int key, cv::Mat& displayFrame);
+    void extractHSVFromSamplingRect();
+    void calculateEnhancedRatios();
+    bool finalizeCalibration();
+    bool isCalibrating() const { return isActive; }
+};
+
+#endif
