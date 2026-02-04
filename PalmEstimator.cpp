@@ -1,7 +1,7 @@
 #include "PalmEstimator.h"
 #include <algorithm>
 #include <iostream>
-
+#include "TemporalSmoother.h" 
 // External declarations from main.cpp
 extern cv::Point2f lastValidPalm;
 extern cv::Point2f lastValidThumbBase;
@@ -57,6 +57,17 @@ PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat&
                     float geometryScore = computeGeometryConsistencyScore(contours[i], contourCenter, 
                         std::sqrt(area / M_PI));
                     score *= (1.0f + geometryScore * 0.5f);
+                    
+                    // Enhanced: Check hand rotation consistency
+                    if (geometryUpdater.getState().handFrame.palmCenter.x >= 0) {
+                        const auto& handFrame = geometryUpdater.getHandFrame();
+                        cv::Point2f localCenter = handFrame.toHandLocal(contourCenter);
+                        float centerDist = cv::norm(localCenter);
+                        
+                        if (centerDist < 100.0f) {
+                            score += 300.0f; // Bonus for being near expected position
+                        }
+                    }
                     
                     if (isCalibrated) {
                         float distFromCalibrated = cv::norm(contourCenter - calibrationData.palmCenter);
@@ -122,14 +133,20 @@ PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat&
             case FINGER_STATE_OPEN: stateStr = " (open)"; break;
         }
         
+        // Enhanced confidence reporting with hand rotation info
+        std::string rotationInfo = "";
+        if (geometryUpdater.getState().handRotationVelocity > 0.1f) {
+            rotationInfo = " [rotating]";
+        }
+        
         if (anatConfidence > 0.7f) {
-            result.status = "Hand (stable)" + stateStr;
+            result.status = "Hand (stable)" + stateStr + rotationInfo;
             result.confidence = overallConfidence;
         } else if (anatConfidence > 0.3f) {
-            result.status = "Hand (correcting)" + stateStr;
+            result.status = "Hand (correcting)" + stateStr + rotationInfo;
             result.confidence = overallConfidence * 0.7f;
         } else {
-            result.status = "Hand (low anatomy)" + stateStr;
+            result.status = "Hand (low anatomy)" + stateStr + rotationInfo;
             result.confidence = overallConfidence * 0.4f;
         }
         
@@ -179,6 +196,28 @@ bool PalmEstimator::validatePalmShape(const std::vector<cv::Point>& contour, con
     
     float geometryScore = computeGeometryConsistencyScore(contour, palmCenter, mean);
     if (geometryScore < 0.3f) {
+        return false;
+    }
+    
+    // Enhanced: Check for reasonable finger count based on convexity defects
+    std::vector<int> hullIndices;
+    cv::convexHull(contour, hullIndices, false, false);
+    
+    std::vector<cv::Vec4i> defects;
+    if (hullIndices.size() > 3) {
+        cv::convexityDefects(contour, hullIndices, defects);
+    }
+    
+    int validDefects = 0;
+    for (const auto& defect : defects) {
+        float depth = defect[3] / 256.0f;
+        if (depth > mean * MIN_DEFECT_DEPTH_RATIO) {
+            validDefects++;
+        }
+    }
+    
+    // Reject contours that look like faces/arms (too many defects or too few)
+    if (validDefects > 8 || (validDefects == 0 && contour.size() > 100)) {
         return false;
     }
     
@@ -250,7 +289,14 @@ float PalmEstimator::computeGeometryConsistencyScore(const std::vector<cv::Point
                        std::max(1.0f, std::min(ellipse.size.width, ellipse.size.height));
     float aspectScore = std::min(1.0f, aspectRatio / 2.0f);
     
-    return defectScore * 0.5f + symmetryScore * 0.3f + aspectScore * 0.2f;
+    // Enhanced: Check finger spread consistency
+    float spreadScore = 0.0f;
+    if (validDefects >= 2) {
+        float avgDefectDepth = totalDefectDepth / validDefects;
+        spreadScore = std::min(1.0f, avgDefectDepth / (palmRadius * 0.3f));
+    }
+    
+    return defectScore * 0.4f + symmetryScore * 0.2f + aspectScore * 0.2f + spreadScore * 0.2f;
 }
 
 bool PalmEstimator::couldBeHand(const std::vector<cv::Point>& contour, float& aspect, float& solidity) {
@@ -331,6 +377,10 @@ bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour,
             static_cast<float>(m.m01 / m.m00)
         );
     }
+    
+    // Enhanced: Use temporal smoother for palm center
+    static TemporalSmoother palmSmoother;
+    palmCenter = palmSmoother.smoothWithJerkLimit(palmCenter);
     
     if (lastValidPalm.x >= 0) {
         float jumpDist = cv::norm(palmCenter - lastValidPalm);
@@ -458,6 +508,13 @@ void PalmEstimator::draw(cv::Mat& frame, const Result& result,
             
             cv::circle(frame, state.smoothedPalmCenter, 8, cv::Scalar(0, 255, 255), -1);
             
+            // Draw hand reference frame
+            cv::Point2f wristDirEnd = state.palmCenter + state.handFrame.wristDirection * 50.0f;
+            cv::Point2f lateralDirEnd = state.palmCenter + state.handFrame.lateralDirection * 50.0f;
+            
+            cv::arrowedLine(frame, state.palmCenter, wristDirEnd, cv::Scalar(0, 255, 0), 2);
+            cv::arrowedLine(frame, state.palmCenter, lateralDirEnd, cv::Scalar(255, 0, 0), 2);
+            
             const auto& fingers = geometryUpdater.getFingerIdentities();
             for (const auto& finger : fingers) {
                 if (finger.isDetected) {
@@ -517,6 +574,10 @@ void PalmEstimator::draw(cv::Mat& frame, const Result& result,
                         finger.isLocked ? cv::Scalar(0, 255, 0) : cv::Scalar(200, 200, 200),
                         1
                     );
+                    
+                    // Draw hand-local coordinates
+                    cv::Point2f localPos = state.toCamera(finger.handLocalTip);
+                    cv::circle(frame, localPos, 3, cv::Scalar(255, 255, 0), -1);
                 }
             }
             
@@ -557,6 +618,7 @@ void PalmEstimator::draw(cv::Mat& frame, const Result& result,
             stateInfo += " | Fingers: " + std::to_string(geometryUpdater.getDetectedFingerCount());
             stateInfo += " | Conf: " + std::to_string((int)(geometryUpdater.getOverallConfidence() * 100)) + "%";
             stateInfo += " | Sm: " + std::to_string((int)(state.currentSmoothingAlpha * 100)) + "%";
+            stateInfo += " | Rot: " + std::to_string((int)(state.handRotation * 180.0f / M_PI)) + "°";
             if (state.hsvIsRelaxed) {
                 stateInfo += " HSV-R";
             }
@@ -579,7 +641,8 @@ void PalmEstimator::draw(cv::Mat& frame, const Result& result,
     if (result.handDetected) {
         std::string info = "Area: " + std::to_string((int)result.area) +
                           " | Fingers: " + std::to_string(geometryUpdater.getFingerIdentities().size()) +
-                          " | Anat: " + std::to_string((int)(geometryUpdater.getAnatomicalConfidence() * 100)) + "%";
+                          " | Anat: " + std::to_string((int)(geometryUpdater.getAnatomicalConfidence() * 100)) + "%" +
+                          " | RotVel: " + std::to_string((int)(geometryUpdater.getState().handRotationVelocity * 180.0f / M_PI)) + "°/f";
         cv::putText(frame, info, cv::Point(10, 50),
                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 200), 1);
     }

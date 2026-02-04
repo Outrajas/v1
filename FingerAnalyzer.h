@@ -18,10 +18,102 @@ constexpr float FA_THUMB_PINKY_BASE_WIDTH_RATIO_MAX = 1.4f;
 constexpr float FA_WRIST_FINGER_DISTANCE_RATIO = 1.2f;
 constexpr float FA_MAX_WRIST_DISTANCE_RATIO = 1.8f;
 
+// New constants for hand-local coordinate system
+constexpr int FA_HAND_REFERENCE_HISTORY = 10;
+constexpr float FA_HAND_AXIS_SMOOTHING = 0.15f;
+constexpr float FA_LATERAL_AXIS_SMOOTHING = 0.15f;
+constexpr float FA_IDENTITY_LOCK_THRESHOLD = 0.85f;
+constexpr int FA_IDENTITY_COOLDOWN_FRAMES = 30;
+constexpr float FA_FINGER_REASSIGNMENT_COST_THRESHOLD = 200.0f;
+constexpr float FA_ROTATION_COMPENSATION_ALPHA = 0.05f;
+constexpr float FA_MIN_ROTATION_FOR_REASSIGNMENT = 0.3f; // radians
+
 enum FingerState {
     FINGER_STATE_FIST = 0,
     FINGER_STATE_PARTIAL = 1,
     FINGER_STATE_OPEN = 2
+};
+
+// Hand reference frame for rotation-robust tracking
+struct HandReferenceFrame {
+    cv::Point2f palmCenter;
+    cv::Point2f wristDirection;    // Unit vector pointing from palm to wrist
+    cv::Point2f lateralDirection;  // Unit vector perpendicular to wristDirection
+    float rotationAngle = 0.0f;    // Current hand rotation relative to vertical
+    float rotationVelocity = 0.0f; // Rate of rotation change
+    
+    // History for smoothing
+    std::deque<cv::Point2f> wristDirHistory;
+    std::deque<cv::Point2f> lateralDirHistory;
+    
+    void update(const cv::Point2f& newPalm, const cv::Point2f& newWristDir, 
+                const cv::Point2f& newLateralDir) {
+        palmCenter = newPalm;
+        
+        // Smooth wrist direction
+        if (wristDirHistory.size() >= FA_HAND_REFERENCE_HISTORY) {
+            wristDirHistory.pop_front();
+        }
+        wristDirHistory.push_back(newWristDir);
+        
+        // Compute smoothed wrist direction
+        cv::Point2f smoothedWrist(0, 0);
+        for (const auto& dir : wristDirHistory) {
+            smoothedWrist += dir;
+        }
+        if (cv::norm(smoothedWrist) > 0.001f) {
+            wristDirection = smoothedWrist * (1.0f / cv::norm(smoothedWrist));
+        } else {
+            wristDirection = newWristDir;
+        }
+        
+        // Smooth lateral direction
+        if (lateralDirHistory.size() >= FA_HAND_REFERENCE_HISTORY) {
+            lateralDirHistory.pop_front();
+        }
+        lateralDirHistory.push_back(newLateralDir);
+        
+        // Compute smoothed lateral direction
+        cv::Point2f smoothedLateral(0, 0);
+        for (const auto& dir : lateralDirHistory) {
+            smoothedLateral += dir;
+        }
+        if (cv::norm(smoothedLateral) > 0.001f) {
+            lateralDirection = smoothedLateral * (1.0f / cv::norm(smoothedLateral));
+        } else {
+            lateralDirection = newLateralDir;
+        }
+        
+        // Update rotation angle (angle of wristDirection from vertical)
+        rotationAngle = std::atan2(wristDirection.y, wristDirection.x);
+    }
+    
+    // Convert point from camera coordinates to hand-relative coordinates
+    cv::Point2f toHandLocal(const cv::Point2f& point) const {
+        cv::Point2f relative = point - palmCenter;
+        cv::Point2f local;
+        local.x = relative.dot(lateralDirection);   // Lateral position
+        local.y = relative.dot(wristDirection);     // Along-hand position
+        return local;
+    }
+    
+    // Convert hand-relative coordinates back to camera coordinates
+    cv::Point2f toCamera(const cv::Point2f& localPoint) const {
+        return palmCenter + lateralDirection * localPoint.x + wristDirection * localPoint.y;
+    }
+    
+    // Get angle in hand-relative coordinate system
+    float getHandRelativeAngle(const cv::Point2f& point) const {
+        cv::Point2f local = toHandLocal(point);
+        return std::atan2(local.y, local.x);
+    }
+    
+    void reset() {
+        wristDirHistory.clear();
+        lateralDirHistory.clear();
+        rotationAngle = 0.0f;
+        rotationVelocity = 0.0f;
+    }
 };
 
 struct FingerIdentity {
@@ -41,11 +133,32 @@ struct FingerIdentity {
     float lateralProjection = 0.0f;
     int stableFrames = 0;
     
-    void update(const cv::Point2f& newRawTip, float newAngle, float newPalmRelativeAngle, float newLateralProjection);
+    // New: Hand-relative tracking
+    cv::Point2f handLocalTip;          // Position in hand-local coordinates
+    cv::Point2f handLocalVelocity;     // Velocity in hand-local space
+    float handRelativeAngle = 0.0f;    // Angle in hand-relative coordinate system
+    float normalizedRadius = 0.0f;     // Distance from palm, normalized by hand scale
+    
+    // New: Temporal coherence metrics
+    float angularMomentum = 0.0f;      // Rate of angle change
+    int cooldownCounter = 0;           // Frames until reassignment allowed
+    cv::Point2f velocityHistory[3];    // Recent velocities for continuity checking
+    int velocityHistoryIndex = 0;
+    
+    void update(const cv::Point2f& newRawTip, float newAngle, float newPalmRelativeAngle, 
+                float newLateralProjection, const cv::Point2f& newHandLocalTip,
+                float newHandRelativeAngle, float newNormalizedRadius);
     void decay();
-    void updatePositionOnly(const cv::Point2f& newRawTip, float newPalmRelativeAngle, float newLateralProjection);
+    void updatePositionOnly(const cv::Point2f& newRawTip, float newPalmRelativeAngle, 
+                           float newLateralProjection, const cv::Point2f& newHandLocalTip,
+                           float newHandRelativeAngle, float newNormalizedRadius);
     float getReassignmentPenalty() const;
-    bool shouldAllowReassignment(float newPalmRelativeAngle) const;
+    bool shouldAllowReassignment(float newHandRelativeAngle, float rotationDelta) const;
+    
+    // New: Update velocity and momentum
+    void updateVelocity(const cv::Point2f& newHandLocalTip);
+    float computeContinuityScore(const cv::Point2f& candidateLocalTip, 
+                                 float candidateHandRelativeAngle) const;
 };
 
 struct FingerCalibration {
@@ -241,6 +354,18 @@ struct HandGeometryState {
     FingerState fingerState = FINGER_STATE_OPEN;
     int detectedFingerCount = 0;
     
+    // New: Hand reference frame for rotation-robust tracking
+    HandReferenceFrame handFrame;
+    float handRotation = 0.0f;
+    float handRotationVelocity = 0.0f;
+    cv::Point2f lastHandAxis;
+    cv::Point2f lastLateralAxis;
+    
+    // New: Multi-layer smoothing buffers
+    std::deque<cv::Point2f> palmSmoothingBuffer;
+    std::deque<cv::Point2f> wristDirSmoothingBuffer;
+    std::deque<cv::Point2f> fingerTipSmoothingBuffer[5];
+    
     void reset();
     void computeThumbPinkyBaseWidth();
     void computeFingerGeometry();
@@ -261,6 +386,21 @@ struct HandGeometryState {
     void updateValidity(bool newValid);
     void updateHSVConfidence(bool hsvValid, int skinPixels, int dynamicMinSkin);
     float getOverallConfidence() const;
+    
+    // New: Hand-local coordinate system methods
+    void updateHandReferenceFrame();
+    cv::Point2f toHandLocal(const cv::Point2f& point) const;
+    cv::Point2f toCamera(const cv::Point2f& localPoint) const;
+    float getHandRelativeAngle(const cv::Point2f& point) const;
+    
+    // New: Multi-layer smoothing methods
+    cv::Point2f smoothPalmCenter(const cv::Point2f& newPalm);
+    cv::Point2f smoothWristDirection(const cv::Point2f& newWristDir);
+    cv::Point2f smoothFingerTip(int fingerId, const cv::Point2f& newTip);
+    
+    // New: Rotation compensation
+    float computeHandRotation() const;
+    void compensateRotation(std::vector<FingerIdentity>& candidates);
 };
 
 class GeometryUpdater {
@@ -337,6 +477,9 @@ public:
     void updateHSVConfidence(bool hsvValid, int skinPixels, int dynamicMinSkin) {
         currentState.updateHSVConfidence(hsvValid, skinPixels, dynamicMinSkin);
     }
+    
+    // New: Get hand reference frame
+    const HandReferenceFrame& getHandFrame() const { return currentState.handFrame; }
 };
 
 #endif

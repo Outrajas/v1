@@ -39,15 +39,33 @@ constexpr float WRIST_WIDTH_RATIO = 0.8f;
 constexpr float WRIST_ANGULAR_TOLERANCE = 0.5f;
 constexpr int WRIST_FALLBACK_FRAMES = 15;
 
+// New constants for hand-local tracking
+constexpr float HAND_ROTATION_SMOOTHING = 0.1f;
+constexpr float FINGER_VELOCITY_SMOOTHING = 0.3f;
+constexpr float ANGULAR_MOMENTUM_SMOOTHING = 0.2f;
+constexpr float MAX_FINGER_VELOCITY = 50.0f;
+constexpr float MAX_ANGULAR_VELOCITY = 0.5f;
+constexpr float MULTI_TERM_MATCHING_WEIGHTS[] = {0.4f, 0.3f, 0.2f, 0.1f}; // distance, angle, velocity, lateral
+
 // External declarations
 extern std::atomic<bool> isCalibrated;  // Changed from bool to std::atomic<bool>
 extern CalibrationResult calibrationData;
 extern GeometryUpdater geometryUpdater;
 extern ShapeAnchoredTracker shapeTracker;
 
-void FingerIdentity::update(const cv::Point2f& newRawTip, float newAngle, float newPalmRelativeAngle, float newLateralProjection) {
+void FingerIdentity::update(const cv::Point2f& newRawTip, float newAngle, float newPalmRelativeAngle, 
+                           float newLateralProjection, const cv::Point2f& newHandLocalTip,
+                           float newHandRelativeAngle, float newNormalizedRadius) {
     lastTip = rawTip;
     rawTip = newRawTip;
+    
+    // Update hand-local properties
+    handLocalTip = newHandLocalTip;
+    handRelativeAngle = newHandRelativeAngle;
+    normalizedRadius = newNormalizedRadius;
+    
+    // Update velocity
+    updateVelocity(newHandLocalTip);
     
     displayTip = newRawTip;
     
@@ -64,16 +82,27 @@ void FingerIdentity::update(const cv::Point2f& newRawTip, float newAngle, float 
         smoothedAngle += angleDiff * 0.3f;
     }
     
+    // Update angular momentum (rate of angle change)
+    float angleChange = newHandRelativeAngle - handRelativeAngle;
+    while (angleChange > M_PI) angleChange -= 2 * M_PI;
+    while (angleChange < -M_PI) angleChange += 2 * M_PI;
+    angularMomentum = angularMomentum * (1.0f - ANGULAR_MOMENTUM_SMOOTHING) + 
+                     angleChange * ANGULAR_MOMENTUM_SMOOTHING;
+    
     isDetected = true;
     persistenceCounter = FINGER_IDENTITY_PERSISTENCE_FRAMES;
     confidence = std::min(1.0f, confidence + 0.25f);
     framesSinceUpdate = 0;
     stableFrames++;
     
-    if (confidence >= FINGER_CONFIDENCE_LOCK_THRESHOLD && !isLocked && stableFrames >= FINGER_MIN_PERSISTENCE_FOR_LOCK) {
+    // Reset cooldown when updated
+    cooldownCounter = 0;
+    
+    if (confidence >= FA_IDENTITY_LOCK_THRESHOLD && !isLocked && stableFrames >= FINGER_MIN_PERSISTENCE_FOR_LOCK) {
         isLocked = true;
         lockFrames = 0;
         confidence = 1.0f;
+        cooldownCounter = FA_IDENTITY_COOLDOWN_FRAMES; // Enter cooldown after locking
     }
     if (isLocked) {
         lockFrames++;
@@ -91,12 +120,18 @@ void FingerIdentity::decay() {
     }
     framesSinceUpdate++;
     
+    // Update cooldown counter
+    if (cooldownCounter > 0) {
+        cooldownCounter--;
+    }
+    
     if (isLocked && framesSinceUpdate > 3) {
         confidence *= 0.85f;
-        if (confidence < FINGER_CONFIDENCE_LOCK_THRESHOLD * 0.5f || framesSinceUpdate > FINGER_LOCK_DECAY_FRAMES) {
+        if (confidence < FA_IDENTITY_LOCK_THRESHOLD * 0.5f || framesSinceUpdate > FINGER_LOCK_DECAY_FRAMES) {
             isLocked = false;
             lockFrames = 0;
             stableFrames = 0;
+            cooldownCounter = 0;
         }
     }
     
@@ -105,34 +140,108 @@ void FingerIdentity::decay() {
     }
 }
 
-void FingerIdentity::updatePositionOnly(const cv::Point2f& newRawTip, float newPalmRelativeAngle, float newLateralProjection) {
+void FingerIdentity::updatePositionOnly(const cv::Point2f& newRawTip, float newPalmRelativeAngle, 
+                                       float newLateralProjection, const cv::Point2f& newHandLocalTip,
+                                       float newHandRelativeAngle, float newNormalizedRadius) {
     lastTip = rawTip;
     rawTip = newRawTip;
+    
+    // Update hand-local properties
+    handLocalTip = newHandLocalTip;
+    handRelativeAngle = newHandRelativeAngle;
+    normalizedRadius = newNormalizedRadius;
+    
+    // Update velocity
+    updateVelocity(newHandLocalTip);
     
     displayTip = newRawTip;
     
     palmRelativeAngle = newPalmRelativeAngle;
     lateralProjection = newLateralProjection;
     framesSinceUpdate = 0;
+    
+    // Reset cooldown when updated
+    cooldownCounter = 0;
+    
     if (isDetected) {
         stableFrames++;
     }
 }
 
+void FingerIdentity::updateVelocity(const cv::Point2f& newHandLocalTip) {
+    // Store in history
+    velocityHistory[velocityHistoryIndex] = handLocalVelocity;
+    velocityHistoryIndex = (velocityHistoryIndex + 1) % 3;
+    
+    // Compute new velocity if we have previous position
+    if (framesSinceUpdate == 0 && handLocalTip.x != -1) {
+        cv::Point2f newVelocity = newHandLocalTip - handLocalTip;
+        
+        // Clamp velocity to prevent spikes
+        float velMag = cv::norm(newVelocity);
+        if (velMag > MAX_FINGER_VELOCITY) {
+            newVelocity = newVelocity * (MAX_FINGER_VELOCITY / velMag);
+        }
+        
+        handLocalVelocity = handLocalVelocity * (1.0f - FINGER_VELOCITY_SMOOTHING) + 
+                           newVelocity * FINGER_VELOCITY_SMOOTHING;
+    }
+}
+
+float FingerIdentity::computeContinuityScore(const cv::Point2f& candidateLocalTip, 
+                                            float candidateHandRelativeAngle) const {
+    if (!isDetected || handLocalTip.x < 0) {
+        return 0.0f;
+    }
+    
+    // 1. Distance continuity
+    float distance = cv::norm(candidateLocalTip - handLocalTip);
+    float distanceScore = std::exp(-distance / 30.0f);
+    
+    // 2. Angular continuity
+    float angleDiff = std::abs(candidateHandRelativeAngle - handRelativeAngle);
+    if (angleDiff > M_PI) angleDiff = 2 * M_PI - angleDiff;
+    float angleScore = std::exp(-angleDiff / 0.5f);
+    
+    // 3. Velocity continuity (predict where finger should be)
+    cv::Point2f predictedPos = handLocalTip + handLocalVelocity;
+    float velocityDist = cv::norm(candidateLocalTip - predictedPos);
+    float velocityScore = std::exp(-velocityDist / 20.0f);
+    
+    // 4. Angular momentum continuity
+    float angleChange = candidateHandRelativeAngle - handRelativeAngle;
+    while (angleChange > M_PI) angleChange -= 2 * M_PI;
+    while (angleChange < -M_PI) angleChange += 2 * M_PI;
+    float momentumDiff = std::abs(angleChange - angularMomentum);
+    float momentumScore = std::exp(-momentumDiff / 0.3f);
+    
+    // Weighted combination
+    return distanceScore * 0.35f + angleScore * 0.25f + velocityScore * 0.25f + momentumScore * 0.15f;
+}
+
 float FingerIdentity::getReassignmentPenalty() const {
+    if (isLocked && cooldownCounter > 0) {
+        return 1000.0f; // Very high penalty during cooldown
+    }
     if (isLocked) {
-        return FINGER_REASSIGNMENT_DISTANCE_PENALTY * (1.0f + confidence);
+        return FINGER_REASSIGNMENT_DISTANCE_PENALTY * (1.0f + confidence) * 5.0f;
     }
     return 1.0f + (confidence * 0.8f);
 }
 
-bool FingerIdentity::shouldAllowReassignment(float newPalmRelativeAngle) const {
+bool FingerIdentity::shouldAllowReassignment(float newHandRelativeAngle, float rotationDelta) const {
     if (!isLocked) return true;
     
-    float angleDiff = std::abs(newPalmRelativeAngle - palmRelativeAngle);
+    if (cooldownCounter > 0) {
+        return false; // Never allow reassignment during cooldown
+    }
+    
+    float angleDiff = std::abs(newHandRelativeAngle - handRelativeAngle);
     if (angleDiff > M_PI) angleDiff = 2 * M_PI - angleDiff;
     
-    return angleDiff > FINGER_ANGLE_REASSIGN_THRESHOLD;
+    // Allow reassignment only for significant hand rotation or large angle changes
+    return (angleDiff > FA_MIN_ROTATION_FOR_REASSIGNMENT) || 
+           (rotationDelta > FA_MIN_ROTATION_FOR_REASSIGNMENT);
 }
 
 bool ShapeAnchoredTracker::anchorShape(const std::vector<cv::Point>& contour, const cv::Point2f& palmCenter,
@@ -248,6 +357,169 @@ void HandGeometryState::reset() {
     
     fingerState = FINGER_STATE_OPEN;
     detectedFingerCount = 0;
+    
+    // Reset hand reference frame
+    handFrame.reset();
+    handRotation = 0.0f;
+    handRotationVelocity = 0.0f;
+    lastHandAxis = cv::Point2f(0, 1);
+    lastLateralAxis = cv::Point2f(1, 0);
+    
+    // Clear smoothing buffers
+    palmSmoothingBuffer.clear();
+    wristDirSmoothingBuffer.clear();
+    for (int i = 0; i < 5; i++) {
+        fingerTipSmoothingBuffer[i].clear();
+    }
+}
+
+void HandGeometryState::updateHandReferenceFrame() {
+    if (palmCenter.x < 0 || wristMid.x < 0) {
+        // Fallback: use hand axis if wrist not available
+        cv::Point2f wristDir = -handAxis;
+        cv::Point2f lateralDir(-wristDir.y, wristDir.x);
+        
+        if (cv::norm(wristDir) > 0.001f) {
+            wristDir *= (1.0f / cv::norm(wristDir));
+            lateralDir = cv::Point2f(-wristDir.y, wristDir.x);
+        }
+        
+        handFrame.update(palmCenter, wristDir, lateralDir);
+    } else {
+        // Use wrist-to-palm direction
+        cv::Point2f wristDir = palmCenter - wristMid;
+        if (cv::norm(wristDir) > 0.001f) {
+            wristDir *= (1.0f / cv::norm(wristDir));
+        } else {
+            wristDir = cv::Point2f(0, 1);
+        }
+        
+        cv::Point2f lateralDir(-wristDir.y, wristDir.x);
+        handFrame.update(palmCenter, wristDir, lateralDir);
+    }
+    
+    // Update hand rotation
+    float newRotation = handFrame.rotationAngle;
+    if (lastWristAngle != 0.0f) {
+        float rotationDelta = newRotation - lastWristAngle;
+        while (rotationDelta > M_PI) rotationDelta -= 2 * M_PI;
+        while (rotationDelta < -M_PI) rotationDelta += 2 * M_PI;
+        
+        handRotationVelocity = handRotationVelocity * (1.0f - HAND_ROTATION_SMOOTHING) + 
+                              rotationDelta * HAND_ROTATION_SMOOTHING;
+    }
+    handRotation = newRotation;
+    lastWristAngle = newRotation;
+}
+
+cv::Point2f HandGeometryState::toHandLocal(const cv::Point2f& point) const {
+    return handFrame.toHandLocal(point);
+}
+
+cv::Point2f HandGeometryState::toCamera(const cv::Point2f& localPoint) const {
+    return handFrame.toCamera(localPoint);
+}
+
+float HandGeometryState::getHandRelativeAngle(const cv::Point2f& point) const {
+    return handFrame.getHandRelativeAngle(point);
+}
+
+cv::Point2f HandGeometryState::smoothPalmCenter(const cv::Point2f& newPalm) {
+    // Maintain buffer size
+    if (palmSmoothingBuffer.size() >= 5) {
+        palmSmoothingBuffer.pop_front();
+    }
+    palmSmoothingBuffer.push_back(newPalm);
+    
+    // Weighted moving average (more weight to recent frames)
+    cv::Point2f smoothed(0, 0);
+    float totalWeight = 0.0f;
+    
+    for (size_t i = 0; i < palmSmoothingBuffer.size(); i++) {
+        float weight = static_cast<float>(i + 1) / palmSmoothingBuffer.size();
+        smoothed += palmSmoothingBuffer[i] * weight;
+        totalWeight += weight;
+    }
+    
+    if (totalWeight > 0.0f) {
+        smoothed *= (1.0f / totalWeight);
+    }
+    
+    // Clamp maximum movement per frame
+    if (lastSmoothedPalmCenter.x >= 0) {
+        cv::Point2f delta = smoothed - lastSmoothedPalmCenter;
+        float deltaLen = cv::norm(delta);
+        if (deltaLen > 30.0f) { // Max 30 pixels per frame
+            smoothed = lastSmoothedPalmCenter + delta * (30.0f / deltaLen);
+        }
+    }
+    
+    return smoothed;
+}
+
+cv::Point2f HandGeometryState::smoothWristDirection(const cv::Point2f& newWristDir) {
+    // Maintain buffer size
+    if (wristDirSmoothingBuffer.size() >= 5) {
+        wristDirSmoothingBuffer.pop_front();
+    }
+    wristDirSmoothingBuffer.push_back(newWristDir);
+    
+    // Average direction (unit vectors)
+    cv::Point2f smoothed(0, 0);
+    for (const auto& dir : wristDirSmoothingBuffer) {
+        smoothed += dir;
+    }
+    
+    if (cv::norm(smoothed) > 0.001f) {
+        smoothed *= (1.0f / cv::norm(smoothed));
+    }
+    
+    return smoothed;
+}
+
+cv::Point2f HandGeometryState::smoothFingerTip(int fingerId, const cv::Point2f& newTip) {
+    if (fingerId < 0 || fingerId >= 5) return newTip;
+    
+    auto& buffer = fingerTipSmoothingBuffer[fingerId];
+    
+    // Maintain buffer size
+    if (buffer.size() >= 3) {
+        buffer.pop_front();
+    }
+    buffer.push_back(newTip);
+    
+    // Simple moving average
+    cv::Point2f smoothed(0, 0);
+    for (const auto& tip : buffer) {
+        smoothed += tip;
+    }
+    
+    if (!buffer.empty()) {
+        smoothed *= (1.0f / buffer.size());
+    }
+    
+    return smoothed;
+}
+
+float HandGeometryState::computeHandRotation() const {
+    return handRotation;
+}
+
+void HandGeometryState::compensateRotation(std::vector<FingerIdentity>& candidates) {
+    if (std::abs(handRotationVelocity) < 0.05f) {
+        return; // Ignore small rotations
+    }
+    
+    // Adjust candidate angles based on hand rotation
+    float compensation = -handRotationVelocity * FA_ROTATION_COMPENSATION_ALPHA;
+    
+    for (auto& candidate : candidates) {
+        candidate.handRelativeAngle += compensation;
+        
+        // Keep angle in [-π, π]
+        while (candidate.handRelativeAngle > M_PI) candidate.handRelativeAngle -= 2 * M_PI;
+        while (candidate.handRelativeAngle < -M_PI) candidate.handRelativeAngle += 2 * M_PI;
+    }
 }
 
 void HandGeometryState::computeThumbPinkyBaseWidth() {
@@ -345,15 +617,15 @@ void HandGeometryState::updateFingerTipsFromIdentities() {
             switch (finger.id) {
                 case 0: 
                     rawThumbTip = finger.rawTip;
-                    displayThumbTip = finger.displayTip;
+                    displayThumbTip = smoothFingerTip(0, finger.displayTip);
                     break;
                 case 1: 
                     rawIndexTip = finger.rawTip;
-                    displayIndexTip = finger.displayTip;
+                    displayIndexTip = smoothFingerTip(1, finger.displayTip);
                     break;
                 case 2: 
                     rawMiddleFingerTip = finger.rawTip;
-                    displayMiddleFingerTip = finger.displayTip;
+                    displayMiddleFingerTip = smoothFingerTip(2, finger.displayTip);
                     break;
             }
         }
@@ -459,73 +731,128 @@ void HandGeometryState::matchFingerIdentities(std::vector<FingerIdentity>& curre
         return;
     }
     
+    // Update hand reference frame before matching
+    updateHandReferenceFrame();
+    
+    // Compensate for hand rotation
+    compensateRotation(currentCandidates);
+    
+    // Convert candidates to hand-local coordinates
     for (auto& candidate : currentCandidates) {
         cv::Point2f vec = candidate.rawTip - palmCenter;
         candidate.palmRelativeAngle = std::atan2(vec.y, vec.x);
         candidate.lateralProjection = lateralAxis.dot(vec);
+        
+        // Hand-local properties
+        candidate.handLocalTip = toHandLocal(candidate.rawTip);
+        candidate.handRelativeAngle = getHandRelativeAngle(candidate.rawTip);
+        candidate.normalizedRadius = cv::norm(candidate.handLocalTip) / (palmRadius > 0 ? palmRadius : 1.0f);
+        
         candidate.id = -1;
     }
     
     std::vector<FingerIdentity> matchedFingers;
     std::vector<bool> candidateUsed(currentCandidates.size(), false);
     
+    // Sort candidates by lateral projection in hand-local space
     std::sort(currentCandidates.begin(), currentCandidates.end(),
         [](const FingerIdentity& a, const FingerIdentity& b) {
-            return a.lateralProjection < b.lateralProjection;
+            return a.handLocalTip.x < b.handLocalTip.x; // Lateral position
         });
     
+    // Multi-term matching: try to match existing fingers first
     for (auto& lastFinger : lastFrameFingers) {
         if (lastFinger.isDetected || lastFinger.persistenceCounter > 0) {
             int bestMatchIdx = -1;
-            float bestMatchScore = std::numeric_limits<float>::max();
+            float bestMatchScore = std::numeric_limits<float>::lowest();
             
             for (size_t i = 0; i < currentCandidates.size(); i++) {
                 if (candidateUsed[i]) continue;
-                if (!lastFinger.shouldAllowReassignment(currentCandidates[i].palmRelativeAngle)) continue;
                 
-                float dist = cv::norm(currentCandidates[i].rawTip - lastFinger.rawTip);
-                float angleDiff = std::abs(currentCandidates[i].palmRelativeAngle - lastFinger.palmRelativeAngle);
-                if (angleDiff > M_PI) angleDiff = 2 * M_PI - angleDiff;
+                // Check if reassignment is allowed
+                float rotationDelta = std::abs(handRotationVelocity);
+                if (!lastFinger.shouldAllowReassignment(currentCandidates[i].handRelativeAngle, rotationDelta)) {
+                    continue;
+                }
                 
-                float score = dist * lastFinger.getReassignmentPenalty() + angleDiff * 30.0f;
+                // Compute multi-term matching score
+                float continuityScore = lastFinger.computeContinuityScore(
+                    currentCandidates[i].handLocalTip,
+                    currentCandidates[i].handRelativeAngle
+                );
                 
-                if (score < bestMatchScore) {
+                // Additional cost terms
+                float distanceCost = cv::norm(currentCandidates[i].handLocalTip - lastFinger.handLocalTip);
+                float angleCost = std::abs(currentCandidates[i].handRelativeAngle - lastFinger.handRelativeAngle);
+                if (angleCost > M_PI) angleCost = 2 * M_PI - angleCost;
+                
+                float lateralOrderCost = std::abs(static_cast<float>(i) - lastFinger.id);
+                
+                // Combined score (higher is better)
+                float score = continuityScore * 100.0f - 
+                             distanceCost * MULTI_TERM_MATCHING_WEIGHTS[0] -
+                             angleCost * 30.0f * MULTI_TERM_MATCHING_WEIGHTS[1] -
+                             lateralOrderCost * 10.0f * MULTI_TERM_MATCHING_WEIGHTS[3];
+                
+                // Apply penalty for reassignment
+                score -= lastFinger.getReassignmentPenalty() * 10.0f;
+                
+                if (score > bestMatchScore) {
                     bestMatchScore = score;
                     bestMatchIdx = static_cast<int>(i);
                 }
             }
             
-            if (bestMatchIdx >= 0 && bestMatchScore < MAX_FINGER_REASSIGN_DISTANCE * 2.0f) {
+            if (bestMatchIdx >= 0 && bestMatchScore > FA_FINGER_REASSIGNMENT_COST_THRESHOLD) {
                 FingerIdentity matched = currentCandidates[bestMatchIdx];
                 matched.id = lastFinger.id;
                 
-                if (lastFinger.isLocked && lastFinger.confidence > 0.5f) {
+                // Preserve locked state with high confidence
+                if (lastFinger.isLocked && lastFinger.confidence > 0.7f) {
                     matched.isLocked = true;
                     matched.confidence = std::min(1.0f, lastFinger.confidence * 0.95f);
                     matched.lockFrames = lastFinger.lockFrames + 1;
                     matched.stableFrames = lastFinger.stableFrames + 1;
+                    matched.cooldownCounter = FA_IDENTITY_COOLDOWN_FRAMES;
+                    
+                    // Preserve velocity history
+                    matched.velocityHistory[0] = lastFinger.velocityHistory[0];
+                    matched.velocityHistory[1] = lastFinger.velocityHistory[1];
+                    matched.velocityHistory[2] = lastFinger.velocityHistory[2];
+                    matched.velocityHistoryIndex = lastFinger.velocityHistoryIndex;
+                    matched.handLocalVelocity = lastFinger.handLocalVelocity;
+                    matched.angularMomentum = lastFinger.angularMomentum;
                 }
                 
                 matched.persistenceCounter = std::min(FINGER_IDENTITY_PERSISTENCE_FRAMES, 
                                                      lastFinger.persistenceCounter + 4);
                 matched.smoothedAngle = lastFinger.smoothedAngle * 0.6f + matched.angle * 0.4f;
                 matched.confidence = std::min(1.0f, lastFinger.confidence * 0.8f + 0.2f);
+                
+                // Update with proper hand-local info
+                matched.updatePositionOnly(matched.rawTip, matched.palmRelativeAngle, 
+                                          matched.lateralProjection, matched.handLocalTip,
+                                          matched.handRelativeAngle, matched.normalizedRadius);
+                
                 matchedFingers.push_back(matched);
                 candidateUsed[bestMatchIdx] = true;
             } else if (lastFinger.persistenceCounter > 0) {
+                // Keep decaying finger
                 lastFinger.decay();
                 matchedFingers.push_back(lastFinger);
             }
         }
     }
     
+    // Assign new IDs to unmatched candidates
     for (size_t i = 0; i < currentCandidates.size(); i++) {
         if (!candidateUsed[i]) {
+            // Check if too close to any locked finger
             bool tooCloseToLocked = false;
             for (const auto& finger : matchedFingers) {
-                if (finger.isLocked) {
-                    float dist = cv::norm(currentCandidates[i].rawTip - finger.rawTip);
-                    if (dist < FINGER_CANDIDATE_MIN_DISTANCE * 0.5f) {
+                if (finger.isLocked && finger.cooldownCounter > 0) {
+                    float dist = cv::norm(currentCandidates[i].handLocalTip - finger.handLocalTip);
+                    if (dist < FINGER_CANDIDATE_MIN_DISTANCE) {
                         tooCloseToLocked = true;
                         break;
                     }
@@ -539,7 +866,9 @@ void HandGeometryState::matchFingerIdentities(std::vector<FingerIdentity>& curre
         }
     }
     
+    // Enforce finger state constraints
     if (fingerState == FINGER_STATE_PARTIAL && matchedFingers.size() > 2) {
+        // Keep only highest confidence fingers
         std::sort(matchedFingers.begin(), matchedFingers.end(),
             [](const FingerIdentity& a, const FingerIdentity& b) {
                 return a.confidence > b.confidence;
@@ -549,17 +878,20 @@ void HandGeometryState::matchFingerIdentities(std::vector<FingerIdentity>& curre
         }
     }
     
+    // Re-sort by lateral position and assign IDs
     std::sort(matchedFingers.begin(), matchedFingers.end(),
         [](const FingerIdentity& a, const FingerIdentity& b) {
-            return a.lateralProjection < b.lateralProjection;
+            return a.handLocalTip.x < b.handLocalTip.x;
         });
     
+    // Assign IDs based on lateral order
     for (size_t i = 0; i < matchedFingers.size(); i++) {
         if (matchedFingers[i].id < 0 || matchedFingers[i].id > 4) {
             matchedFingers[i].id = static_cast<int>(i);
         }
     }
     
+    // Limit to 5 fingers
     if (matchedFingers.size() > 5) {
         std::sort(matchedFingers.begin(), matchedFingers.end(),
             [](const FingerIdentity& a, const FingerIdentity& b) {
@@ -567,9 +899,10 @@ void HandGeometryState::matchFingerIdentities(std::vector<FingerIdentity>& curre
             });
         matchedFingers.resize(5);
         
+        // Re-sort and re-assign IDs
         std::sort(matchedFingers.begin(), matchedFingers.end(),
             [](const FingerIdentity& a, const FingerIdentity& b) {
-                return a.lateralProjection < b.lateralProjection;
+                return a.handLocalTip.x < b.handLocalTip.x;
             });
         
         for (size_t i = 0; i < matchedFingers.size(); i++) {
@@ -666,7 +999,7 @@ void HandGeometryState::inferWrist() {
     cv::Point2f wristDir;
     
     if (lastWristDir.x != 0 || lastWristDir.y != 0) {
-        wristDir = lastWristDir;
+        wristDir = smoothWristDirection(lastWristDir);
     } else {
         wristDir = cv::Point2f(0, 1);
     }
@@ -746,13 +1079,8 @@ void HandGeometryState::isolatePalmContourFast(const std::vector<cv::Point>& con
         static_cast<float>(m.m01 / m.m00)
     );
     
-    if (lastWristLeft.x >= 0 && palmCenter.x >= 0) {
-        float jumpDist = cv::norm(newPalmCenter - palmCenter);
-        if (jumpDist > 100.0f) {
-            cv::Point2f direction = (newPalmCenter - palmCenter) * (1.0f / jumpDist);
-            newPalmCenter = palmCenter + direction * (100.0f * 0.5f);
-        }
-    }
+    // Apply smoothing with maximum delta clamping
+    newPalmCenter = smoothPalmCenter(newPalmCenter);
     
     palmCenter = newPalmCenter;
     
@@ -838,6 +1166,9 @@ std::vector<FingerIdentity> HandGeometryState::detectFingerCandidates(const std:
         float distance;
         float palmRelativeAngle;
         float lateralProjection;
+        float handRelativeAngle;
+        cv::Point2f handLocalTip;
+        float normalizedRadius;
         int hullIndex;
     };
     std::vector<Candidate> candidates;
@@ -851,6 +1182,11 @@ std::vector<FingerIdentity> HandGeometryState::detectFingerCandidates(const std:
         float angle = std::atan2(vec.y, vec.x);
         float palmRelativeAngle = std::atan2(vec.y, vec.x);
         float lateralProjection = lateralAxis.dot(vec);
+        
+        // Hand-local coordinates
+        cv::Point2f handLocalTip = toHandLocal(tip);
+        float handRelativeAngle = getHandRelativeAngle(tip);
+        float normalizedRadius = dist / palmRadius;
         
         float minDist = palmRadius * FINGER_DETECTION_DISTANCE_MULTIPLIER_MIN;
         float maxDist = palmRadius * FINGER_DETECTION_DISTANCE_MULTIPLIER_MAX;
@@ -873,7 +1209,9 @@ std::vector<FingerIdentity> HandGeometryState::detectFingerCandidates(const std:
             }
             
             if (maxDepth > palmRadius * FINGER_DETECTION_DEPTH_THRESHOLD_RATIO) {
-                candidates.push_back({tip, angle, maxDepth, dist, palmRelativeAngle, lateralProjection, idx});
+                candidates.push_back({tip, angle, maxDepth, dist, palmRelativeAngle, 
+                                     lateralProjection, handRelativeAngle, handLocalTip,
+                                     normalizedRadius, idx});
             }
         }
     }
@@ -888,8 +1226,9 @@ std::vector<FingerIdentity> HandGeometryState::detectFingerCandidates(const std:
     for (size_t i = 0; i < candidates.size(); i++) {
         bool keep = true;
         for (size_t j = 0; j < filteredCandidates.size(); j++) {
-            float dist = cv::norm(candidates[i].tip - filteredCandidates[j].tip);
-            float angleDiff = std::abs(candidates[i].angle - filteredCandidates[j].angle);
+            // Use hand-local distance for filtering
+            float dist = cv::norm(candidates[i].handLocalTip - filteredCandidates[j].handLocalTip);
+            float angleDiff = std::abs(candidates[i].handRelativeAngle - filteredCandidates[j].handRelativeAngle);
             if (angleDiff > M_PI) angleDiff = 2 * M_PI - angleDiff;
             
             if (dist < minDistThreshold && angleDiff < MIN_FINGER_ANGLE_SEPARATION) {
@@ -907,16 +1246,19 @@ std::vector<FingerIdentity> HandGeometryState::detectFingerCandidates(const std:
         }
     }
     
+    // Sort by hand-local lateral position
     std::sort(filteredCandidates.begin(), filteredCandidates.end(),
         [](const Candidate& a, const Candidate& b) {
-            return a.lateralProjection < b.lateralProjection;
+            return a.handLocalTip.x < b.handLocalTip.x;
         });
     
     for (size_t i = 0; i < filteredCandidates.size(); i++) {
         FingerIdentity finger;
         finger.id = -1;
         finger.update(filteredCandidates[i].tip, filteredCandidates[i].angle,
-                     filteredCandidates[i].palmRelativeAngle, filteredCandidates[i].lateralProjection);
+                     filteredCandidates[i].palmRelativeAngle, filteredCandidates[i].lateralProjection,
+                     filteredCandidates[i].handLocalTip, filteredCandidates[i].handRelativeAngle,
+                     filteredCandidates[i].normalizedRadius);
         finger.confidence = std::min(0.5f, filteredCandidates[i].depth / (palmRadius * 0.3f));
         fingerCandidates.push_back(finger);
     }
@@ -1036,6 +1378,9 @@ void GeometryUpdater::updateGeometry(const cv::Point2f& rawPalmCenter,
         currentState.updateValidity(true);
     }
     
+    // Update hand reference frame before finger tracking
+    currentState.updateHandReferenceFrame();
+    
     currentState.updateFingerTracking();
     currentState.computeFingerGeometry();
     
@@ -1047,7 +1392,8 @@ void GeometryUpdater::updateGeometry(const cv::Point2f& rawPalmCenter,
     if (currentState.smoothedPalmCenter.x < 0) {
         currentState.smoothedPalmCenter = currentPalmCenter;
     } else {
-        currentState.smoothedPalmCenter = currentState.smoothedPalmCenter * 0.6f + currentPalmCenter * 0.4f;
+        // Use the already smoothed palm center
+        currentState.smoothedPalmCenter = currentPalmCenter;
     }
     
     if (rawHandScale > 0) {
