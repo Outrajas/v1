@@ -12,10 +12,45 @@ extern CalibrationResult calibrationData;
 extern GeometryUpdater geometryUpdater;
 extern ShapeAnchoredTracker shapeTracker;
 
+// Helper function: check if point is inside contour
+bool PalmEstimator::isPointInContour(const cv::Point2f& point, const std::vector<cv::Point>& contour) const {
+    if (contour.empty()) return true;
+    cv::Point point_int(static_cast<int>(point.x), static_cast<int>(point.y));
+    return cv::pointPolygonTest(contour, point_int, false) >= 0;
+}
+
+// Helper function: project point to contour interior
+cv::Point2f PalmEstimator::projectPointToContourInterior(const cv::Point2f& point, 
+                                                         const std::vector<cv::Point>& contour,
+                                                         const cv::Point2f& fallback) const {
+    if (contour.empty()) return point;
+    
+    // Check if point is already inside
+    if (isPointInContour(point, contour)) {
+        return point;
+    }
+    
+    // Find nearest point on contour
+    cv::Point2f nearest = point;
+    float minDist = std::numeric_limits<float>::max();
+    
+    for (const auto& p : contour) {
+        cv::Point2f contourPoint(p);
+        float dist = cv::norm(contourPoint - point);
+        if (dist < minDist) {
+            minDist = dist;
+            nearest = contourPoint;
+        }
+    }
+    
+    return nearest;
+}
+
 PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat& motionMask, 
                                            const cv::Mat& skinMask, float hsvConfidence) {
     Result result;
     result.status = "Processing";
+    result.wristHint = cv::Point2f(-1, -1);  // NON-AUTHORITATIVE: GeometryUpdater ignores this
     
     try {
         std::vector<std::vector<cv::Point>> contours;
@@ -51,6 +86,9 @@ PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat&
                         static_cast<float>(m.m10 / m.m00),
                         static_cast<float>(m.m01 / m.m00)
                     );
+                    
+                    // Ensure center is inside contour
+                    contourCenter = projectPointToContourInterior(contourCenter, contours[i], contourCenter);
                     
                     float score = area * 1.0f;
                     
@@ -96,26 +134,23 @@ PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat&
         result.aspectRatio = aspect;
         result.solidity = solidity;
         
-        // Fit contour and estimate wrist position
-        cv::Point2f wristMid;
-        if (!fitContourToModel(result.contour, result.palm, wristMid, result.handSizeScale)) {
+        // STEP 1: PALM CENTER ONLY - NO WRIST INFERENCE
+        if (!fitContourToModel(result.contour, result.palm, result.handSizeScale)) {
             result.status = "Geometry fitting failed";
-        } else {
-            // Store wrist position
-            result.wristMid = wristMid;
         }
         
-        // Update geometry with independent paths
-        geometryUpdater.updateGeometry(result.palm, wristMid, 
-                                      cv::Point2f(-1, -1), cv::Point2f(-1, -1),
+        // Call GeometryUpdater with invalid wrist parameters
+        // GeometryUpdater will compute wristLeft/right internally
+        geometryUpdater.updateGeometry(result.palm, 
+                                      cv::Point2f(-1, -1),  // wristMid: invalid
+                                      cv::Point2f(-1, -1),  // wristLeft: invalid  
+                                      cv::Point2f(-1, -1),  // wristRight: invalid
                                       result.contour);
         
         if (geometryUpdater.isPalmValid()) {
-            result.smoothedPalm = geometryUpdater.getPalmCenter();
-            result.smoothedWristMid = geometryUpdater.getWristMid();
             result.handDetected = true;
             
-            // Get finger state
+            // Get finger state from GeometryUpdater
             result.fingerState = geometryUpdater.getFingerState();
             result.detectedFingerCount = geometryUpdater.getDetectedFingerCount();
             
@@ -146,6 +181,11 @@ PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat&
 
 bool PalmEstimator::validatePalmShape(const std::vector<cv::Point>& contour, const cv::Point2f& palmCenter) {
     if (contour.size() < 20) return true;
+    
+    // First ensure palm center is inside contour
+    if (!isPointInContour(palmCenter, contour)) {
+        return false;
+    }
     
     std::vector<float> distances;
     for (const auto& p : contour) {
@@ -284,6 +324,9 @@ bool PalmEstimator::couldBeHand(const std::vector<cv::Point>& contour, float& as
             static_cast<float>(m.m01 / m.m00)
         );
         
+        // Ensure center is inside contour
+        contourCenter = projectPointToContourInterior(contourCenter, contour, contourCenter);
+        
         float geometryScore = computeGeometryConsistencyScore(contour, contourCenter, 
             std::sqrt(area / M_PI));
         
@@ -293,25 +336,24 @@ bool PalmEstimator::couldBeHand(const std::vector<cv::Point>& contour, float& as
     return true;
 }
 
+// STEP 2: PALM CENTER ONLY - NO WRIST INFERENCE
 bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour, 
                                      cv::Point2f& palmCenter,
-                                     cv::Point2f& wristMid,
                                      float& handSizeScale) {
     if (contour.size() < 8) {
         if (failureFrameCount < PE_MAX_FAILURE_FRAMES && lastValidPalm.x >= 0) {
             palmCenter = lastValidPalm;
-            wristMid = cv::Point2f(palmCenter.x, palmCenter.y + 100);  // Default below palm
             handSizeScale = 1.0f;
             failureFrameCount++;
             return true;
         }
+        return false;
     }
     
     cv::Moments m = cv::moments(contour);
     if (m.m00 == 0) {
         if (failureFrameCount < PE_MAX_FAILURE_FRAMES && lastValidPalm.x >= 0) {
             palmCenter = lastValidPalm;
-            wristMid = cv::Point2f(palmCenter.x, palmCenter.y + 100);
             handSizeScale = 1.0f;
             failureFrameCount++;
             return true;
@@ -319,32 +361,16 @@ bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour,
         if (!contour.empty()) {
             cv::Rect bbox = cv::boundingRect(contour);
             palmCenter = cv::Point2f(bbox.x + bbox.width/2.0f, bbox.y + bbox.height/2.0f);
-            wristMid = cv::Point2f(palmCenter.x, bbox.y + bbox.height);
         }
+        return false;
     } else {
         palmCenter = cv::Point2f(
             static_cast<float>(m.m10 / m.m00),
             static_cast<float>(m.m01 / m.m00)
         );
         
-        // Estimate wrist position as lowest point of contour
-        int lowestY = contour[0].y;
-        cv::Point lowestPoint = contour[0];
-        
-        for (const auto& p : contour) {
-            if (p.y > lowestY) {
-                lowestY = p.y;
-                lowestPoint = p;
-            }
-        }
-        
-        wristMid = cv::Point2f(static_cast<float>(lowestPoint.x), 
-                              static_cast<float>(lowestPoint.y));
-        
-        // Adjust wrist to be below palm
-        if (wristMid.y < palmCenter.y + 20) {
-            wristMid.y = palmCenter.y + 100;  // Force reasonable distance
-        }
+        // ENFORCE INVARIANT: Palm center must be inside contour
+        palmCenter = projectPointToContourInterior(palmCenter, contour, palmCenter);
     }
     
     // Limit palm center jumps
@@ -353,6 +379,9 @@ bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour,
         if (jumpDist > PE_MAX_PALM_CENTER_JUMP && jumpDist > 0.001f) {
             cv::Point2f direction = (palmCenter - lastValidPalm) * (1.0f / jumpDist);
             palmCenter = lastValidPalm + direction * (PE_MAX_PALM_CENTER_JUMP * 0.5f);
+            
+            // Re-project to contour after adjustment
+            palmCenter = projectPointToContourInterior(palmCenter, contour, palmCenter);
         }
     }
     
@@ -372,7 +401,6 @@ bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour,
     if (!validatePalmShape(contour, palmCenter)) {
         if (failureFrameCount < PE_MAX_FAILURE_FRAMES && lastValidPalm.x >= 0) {
             palmCenter = lastValidPalm;
-            wristMid = cv::Point2f(palmCenter.x, palmCenter.y + 100);
             handSizeScale = 1.0f;
             failureFrameCount++;
             return true;
@@ -400,6 +428,7 @@ void PalmEstimator::draw(cv::Mat& frame, const Result& result,
     
     if (result.handDetected || contourGraceCounter > 0) {
         if (geometryUpdater.isPalmValid()) {
+            // Palm contour (from GeometryUpdater, which may be smoothed)
             const auto& palmContour = geometryUpdater.getPalmContour();
             if (!palmContour.empty()) {
                 cv::drawContours(frame, std::vector<std::vector<cv::Point>>{palmContour},
@@ -409,18 +438,31 @@ void PalmEstimator::draw(cv::Mat& frame, const Result& result,
                     0, cv::Scalar(100, 100, 100), 1);
             }
             
-            // Draw palm center
+            // Palm center (from GeometryUpdater, which is smoothed)
             cv::Point2f palmCenter = geometryUpdater.getPalmCenter();
             cv::circle(frame, palmCenter, 8, cv::Scalar(0, 255, 255), -1);
             
-            // Draw wrist
+            // All wrist drawing comes from GeometryUpdater only
+            cv::Point2f wristLeft = geometryUpdater.getWristLeft();
+            cv::Point2f wristRight = geometryUpdater.getWristRight();
             cv::Point2f wristMid = geometryUpdater.getWristMid();
-            if (wristMid.x >= 0) {
-                cv::circle(frame, wristMid, 8, cv::Scalar(255, 0, 0), -1);
-                cv::line(frame, palmCenter, wristMid, cv::Scalar(255, 0, 0), 2);
+            
+            // Draw wrist line and points if GeometryUpdater computed them
+            if (wristLeft.x >= 0 && wristRight.x >= 0) {
+                cv::line(frame, wristLeft, wristRight, cv::Scalar(255, 0, 0), 2);
+                cv::circle(frame, wristLeft, 6, cv::Scalar(255, 0, 0), -1);
+                cv::circle(frame, wristRight, 6, cv::Scalar(255, 0, 0), -1);
                 
-                // Draw hand reference frame
-                const auto& handFrame = geometryUpdater.getHandFrame();
+                // Draw line from palm to wrist mid (derived from left/right)
+                if (wristMid.x >= 0) {
+                    cv::line(frame, palmCenter, wristMid, cv::Scalar(255, 0, 0), 2);
+                    cv::circle(frame, wristMid, 8, cv::Scalar(255, 0, 0), -1);
+                }
+            }
+            
+            // Draw hand reference frame from GeometryUpdater
+            const auto& handFrame = geometryUpdater.getHandFrame();
+            if (handFrame.isValid()) {
                 cv::Point2f axisEnd = palmCenter + handFrame.primaryAxis * 50.0f;
                 cv::Point2f lateralEnd = palmCenter + handFrame.secondaryAxis * 50.0f;
                 
@@ -433,7 +475,7 @@ void PalmEstimator::draw(cv::Mat& frame, const Result& result,
                           cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 0, 0), 1);
             }
             
-            // Draw fingers
+            // Draw fingers from GeometryUpdater
             const auto& fingers = geometryUpdater.getFingerIdentities();
             for (const auto& finger : fingers) {
                 if (finger.isDetected) {
@@ -486,17 +528,7 @@ void PalmEstimator::draw(cv::Mat& frame, const Result& result,
                 }
             }
             
-            // Draw wrist boundaries
-            cv::Point2f wristLeft = geometryUpdater.getWristLeft();
-            cv::Point2f wristRight = geometryUpdater.getWristRight();
-            
-            if (wristLeft.x >= 0 && wristRight.x >= 0) {
-                cv::line(frame, wristLeft, wristRight, cv::Scalar(255, 0, 0), 2);
-                cv::circle(frame, wristLeft, 6, cv::Scalar(255, 0, 0), -1);
-                cv::circle(frame, wristRight, 6, cv::Scalar(255, 0, 0), -1);
-            }
-            
-            // Status info
+            // Status info from GeometryUpdater
             std::string stateInfo;
             switch (geometryUpdater.getFingerState()) {
                 case FINGER_STATE_FIST: stateInfo = "FIST"; break;

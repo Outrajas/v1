@@ -19,7 +19,11 @@ private:
     cv::Rect hsvSamplingRect;
     std::vector<cv::Point> palmTrace;
     
-    cv::Point2f wristMid;  // Changed from left/right to single mid point
+    // TWO-POINT WRIST MODEL - No single midpoint
+    cv::Point2f wristLeft;
+    cv::Point2f wristRight;
+    bool wristLeftMarked = false;
+    bool wristRightMarked = false;
     
     cv::Point2f fingerTips[5];
     cv::Point2f fingerBases[5];
@@ -38,6 +42,14 @@ public:
     void calculateEnhancedRatios();
     bool finalizeCalibration();
     bool isCalibrating() const { return isActive; }
+    
+private:
+    // Helper functions for geometric constraints
+    cv::Point2f projectToContour(const cv::Point2f& point) const;
+    bool validateWristGeometry() const;
+    void normalizeWristPoints();
+    bool isWristOppositeFingers() const;
+    bool isWristWidthValid() const;
 };
 
 #endif

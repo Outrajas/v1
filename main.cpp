@@ -165,6 +165,8 @@ private:
 };
 
 // ==================== FRAME PROCESSING ====================
+// ==================== FRAME PROCESSING ====================
+// ==================== FRAME PROCESSING ====================
 class FrameProcessor {
     MotionEstimator motionEstimator;
     SkinExtractor skinExtractor;
@@ -185,7 +187,7 @@ public:
             geometryUpdater.isPalmValid()
         );
         
-        // ----- STEP 3: Palm Estimation -----
+        // ----- STEP 3: Palm Estimation (READ-ONLY) -----
         auto palmResult = palmEstimator.detect(frame, motionMask, skinMask, hsvConfidence);
         
         // ----- STEP 4: Shape Anchoring -----
@@ -208,7 +210,7 @@ public:
         
         // ----- STEP 5: Cursor Control -----
         if (cursorEnabled && palmResult.handDetected && geometryUpdater.isPalmValid()) {
-            controlCursorBasedOnFingerState(cursorController);
+            controlCursorBasedOnPalmCenter(cursorController);
         }
         
         // ----- STEP 6: Visualization -----
@@ -216,34 +218,13 @@ public:
     }
     
 private:
-    void controlCursorBasedOnFingerState(FastCursorController& cursorController) {
-        FingerState fingerState = geometryUpdater.getFingerState();
-        
-        // Get palm position for cursor control
+    void controlCursorBasedOnPalmCenter(FastCursorController& cursorController) {
+        // ALWAYS use palm center for cursor control
         cv::Point2f palmPos = geometryUpdater.getPalmCenter();
         
-        // Find finger tips for cursor control
-        cv::Point2f middleTip(-1, -1);
-        cv::Point2f thumbTip(-1, -1);
-        cv::Point2f indexTip(-1, -1);
-        
-        const auto& fingers = geometryUpdater.getFingerIdentities();
-        for (const auto& finger : fingers) {
-            if (finger.isDetected) {
-                switch (finger.id) {
-                    case 0: thumbTip = finger.displayTip; break;
-                    case 1: indexTip = finger.displayTip; break;
-                    case 2: middleTip = finger.displayTip; break;
-                }
-            }
-        }
-        
-        if (fingerState == FINGER_STATE_FIST) {
-            // Use palm position for cursor in fist state
+        if (palmPos.x >= 0) {
+            // Use palm center as primary cursor position
             cursorController.move(palmPos, cv::Point2f(-1, -1), cv::Point2f(-1, -1));
-        } else if (middleTip.x >= 0) {
-            // Use middle finger tip for cursor
-            cursorController.move(middleTip, thumbTip, indexTip);
         }
     }
 };

@@ -24,10 +24,8 @@ constexpr float PE_MAX_SYMMETRY_SCORE = 0.85f;
 class PalmEstimator {
 public:
     struct Result {
-        cv::Point2f palm{-1,-1};
-        cv::Point2f wristMid{-1,-1};  // Added for stable reference
-        cv::Point2f smoothedPalm{-1,-1};
-        cv::Point2f smoothedWristMid{-1,-1};
+        cv::Point2f palm{-1,-1};          // REQUIRED: contour-validated palm center
+        cv::Point2f wristHint{-1,-1};     // NON-AUTHORITATIVE: GeometryUpdater ignores this
         bool handDetected = false;
         std::vector<cv::Point> contour;
         cv::Rect boundingBox;
@@ -43,7 +41,7 @@ public:
         
         float handSizeScale = 1.0f;
         
-        // Finger state info
+        // Finger state info (filled by GeometryUpdater)
         FingerState fingerState = FINGER_STATE_OPEN;
         int detectedFingerCount = 0;
     };
@@ -57,13 +55,21 @@ public:
     float computeGeometryConsistencyScore(const std::vector<cv::Point>& contour, 
                                          const cv::Point2f& palmCenter, float palmRadius);
     bool couldBeHand(const std::vector<cv::Point>& contour, float& aspect, float& solidity);
+    
+    // New: Only computes palm center, NO WRIST GEOMETRY
     bool fitContourToModel(std::vector<cv::Point>& contour, 
                           cv::Point2f& palmCenter,
-                          cv::Point2f& wristMid,
                           float& handSizeScale);
     
     void draw(cv::Mat& frame, const Result& result, 
               const cv::Mat& skinMask, const cv::Mat& motionMask);
+    
+private:
+    // Helper functions for contour geometry
+    bool isPointInContour(const cv::Point2f& point, const std::vector<cv::Point>& contour) const;
+    cv::Point2f projectPointToContourInterior(const cv::Point2f& point, 
+                                              const std::vector<cv::Point>& contour,
+                                              const cv::Point2f& fallback) const;
 };
 
 #endif

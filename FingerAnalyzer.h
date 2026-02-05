@@ -27,6 +27,16 @@ constexpr float FA_FINGER_REASSIGNMENT_COST_THRESHOLD = 300.0f;  // Higher thres
 constexpr float FA_MIN_ROTATION_FOR_REASSIGNMENT = 0.5f;  // radians, larger threshold
 constexpr float FA_FINGER_VELOCITY_DISCONTINUITY_THRESHOLD = 30.0f;  // pixels/frame
 
+// Wrist model constants
+constexpr float FA_WRIST_DISTANCE_RATIO_MIN = 0.5f;   // min wrist distance / thumb-pinky width
+constexpr float FA_WRIST_DISTANCE_RATIO_MAX = 1.2f;   // max wrist distance / thumb-pinky width
+constexpr float FA_WRIST_WIDTH_RATIO = 0.6f;          // wrist width / thumb-pinky width
+constexpr float FA_MIN_THUMB_PINKY_WIDTH = 30.0f;     // minimum width to avoid division by zero
+constexpr float FA_BASE_MIN_Y_RELATIVE = 0.1f;        // relative to palm radius for base extraction
+constexpr float FA_WRIST_MOVEMENT_CORROBORATION_ANGLE_THRESHOLD = 0.3f; // radians
+constexpr float FA_TEMPORAL_DECAY_RATE = 0.9f;        // decay rate for lost bases
+constexpr int FA_MIN_CONTOUR_POINTS = 20;             // minimum points for base extraction
+
 // Hand orientation modes
 enum HandOrientationMode {
     HAND_ORIENTATION_WRIST_BASED,     // Primary: wrist direction
@@ -339,7 +349,6 @@ public:
 struct HandGeometryState {
     // Raw inputs (no feedback from smoothing)
     cv::Point2f rawPalmCenter = cv::Point2f(-1, -1);
-    cv::Point2f rawWristMid = cv::Point2f(-1, -1);
     std::vector<cv::Point> rawContour;
     
     // Processed geometry (independent smoothing paths)
@@ -372,19 +381,43 @@ struct HandGeometryState {
     
     // Smoothing buffers (independent)
     std::deque<cv::Point2f> palmSmoothingBuffer;
-    std::deque<cv::Point2f> wristSmoothingBuffer;
-    std::deque<float> wristAngleSmoothingBuffer;
+    std::deque<cv::Point2f> wristLeftSmoothingBuffer;
+    std::deque<cv::Point2f> wristRightSmoothingBuffer;
     
     // Fist detection
     std::vector<cv::Point> palmContour;
     
+    // Wrist model state - PRIMARY DATA FLOW
+    cv::Point2f thumbBase = cv::Point2f(-1, -1);
+    cv::Point2f pinkyBase = cv::Point2f(-1, -1);
+    cv::Point2f lastValidThumbBase = cv::Point2f(-1, -1);
+    cv::Point2f lastValidPinkyBase = cv::Point2f(-1, -1);
+    cv::Point2f lastValidWristLeft = cv::Point2f(-1, -1);
+    cv::Point2f lastValidWristRight = cv::Point2f(-1, -1);
+    cv::Point2f lastValidWristMid = cv::Point2f(-1, -1);
+    float lastValidThumbPinkyWidth = 0.0f;
+    
+    // Geometric constraint helpers
+    bool isPointInContour(const cv::Point2f& point) const;
+    cv::Point2f projectPointToContourInterior(const cv::Point2f& point, const cv::Point2f& fallback) const;
+    
+    // STEP 1: Thumb & Pinky Base Extraction (from contour only)
+    std::pair<cv::Point2f, cv::Point2f> findThumbPinkyBasesFromContour();
+    
+    // STEP 2-4: Wrist Computation Pipeline
+    void computeWristFromBases(const cv::Point2f& thumbBase, const cv::Point2f& pinkyBase);
+    
+    // Anti-drift continuity
+    void applyTemporalContinuity(const cv::Point2f& newPalmCenter, 
+                                const cv::Point2f& lastPalmCenter,
+                                float rotationAngle);
+    
     void reset();
     
     // Independent processing paths
-    void updateRawGeometry(const cv::Point2f& palm, const cv::Point2f& wrist, 
-                          const std::vector<cv::Point>& contour);
+    void updateRawGeometry(const cv::Point2f& palm, const std::vector<cv::Point>& contour);
     void smoothPalmCenter();
-    void smoothWristGeometry();
+    void smoothWristGeometry();  // Smooths left and right independently
     void updateHandReferenceFrame();
     
     // Finger processing (hand-local only)
@@ -410,11 +443,18 @@ struct HandGeometryState {
     cv::Point2f getWristRight() const { return smoothedWristRight; }
     const std::vector<cv::Point>& getPalmContour() const { return palmContour; }
     float getPalmRadius() const { return palmRadius; }
+    cv::Point2f getThumbBase() const { return thumbBase; }
+    cv::Point2f getPinkyBase() const { return pinkyBase; }
 };
 
 class GeometryUpdater {
 private:
     HandGeometryState currentState;
+    cv::Point2f lastPalmCenter = cv::Point2f(-1, -1);
+    cv::Point2f lastWristMid = cv::Point2f(-1, -1);
+    cv::Point2f lastThumbBase = cv::Point2f(-1, -1);
+    cv::Point2f lastPinkyBase = cv::Point2f(-1, -1);
+    float lastThumbPinkyWidth = 0.0f;
     
 public:
     GeometryUpdater() {
@@ -423,9 +463,14 @@ public:
     
     void reset() {
         currentState.reset();
+        lastPalmCenter = cv::Point2f(-1, -1);
+        lastWristMid = cv::Point2f(-1, -1);
+        lastThumbBase = cv::Point2f(-1, -1);
+        lastPinkyBase = cv::Point2f(-1, -1);
+        lastThumbPinkyWidth = 0.0f;
     }
     
-    // Main update - NO feedback loops
+    // Main update - NO feedback loops, IGNORES input wrist
     void updateGeometry(const cv::Point2f& rawPalmCenter,
                        const cv::Point2f& rawWristMid,
                        const cv::Point2f& rawWristLeft,
@@ -484,6 +529,9 @@ public:
     const StableHandReferenceFrame& getHandFrame() const { 
         return currentState.getHandFrame(); 
     }
+    
+    cv::Point2f getThumbBase() const { return currentState.getThumbBase(); }
+    cv::Point2f getPinkyBase() const { return currentState.getPinkyBase(); }
 };
 
 #endif
