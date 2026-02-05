@@ -2,7 +2,7 @@
 #include <iostream>
 
 extern CalibrationResult calibrationData;
-extern std::atomic<bool> isCalibrated;  // Changed from bool to std::atomic<bool>
+extern std::atomic<bool> isCalibrated;
 extern GeometryUpdater geometryUpdater;
 extern ShapeAnchoredTracker shapeTracker;
 
@@ -13,10 +13,9 @@ void EnhancedManualCalibrator::startCalibration(const cv::Mat& frame) {
     hsvRectStart = cv::Point(-1, -1);
     hsvSamplingRect = cv::Rect();
     palmTrace.clear();
-    thumbBase = cv::Point2f(-1, -1);
-    pinkyBase = cv::Point2f(-1, -1);
-    wristLeft = cv::Point2f(-1, -1);
-    wristRight = cv::Point2f(-1, -1);
+    
+    // Initialize points
+    wristMid = cv::Point2f(-1, -1);
     
     for (int i = 0; i < 5; i++) {
         fingerTips[i] = cv::Point2f(-1, -1);
@@ -24,8 +23,6 @@ void EnhancedManualCalibrator::startCalibration(const cv::Mat& frame) {
         fingerTipsMarked[i] = false;
         fingerBasesMarked[i] = false;
     }
-    wristLeftMarked = false;
-    wristRightMarked = false;
     
     calibrationStep = 0;
     isActive = true;
@@ -83,9 +80,6 @@ void EnhancedManualCalibrator::handleMouse(int event, int x, int y) {
                         fingerBases[i] = cv::Point2f(static_cast<float>(x), static_cast<float>(y));
                         fingerBasesMarked[i] = true;
                         std::cout << fingerNames[i] << " base marked" << std::endl;
-                        
-                        if (i == 0) thumbBase = fingerBases[i];
-                        if (i == 4) pinkyBase = fingerBases[i];
                         break;
                     }
                 }
@@ -107,16 +101,8 @@ void EnhancedManualCalibrator::handleMouse(int event, int x, int y) {
             
         case 4:
             if (event == cv::EVENT_LBUTTONDOWN) {
-                if (!wristLeftMarked) {
-                    wristLeft = cv::Point2f(static_cast<float>(x), static_cast<float>(y));
-                    wristLeftMarked = true;
-                    std::cout << "Left wrist boundary marked" << std::endl;
-                }
-                else if (!wristRightMarked) {
-                    wristRight = cv::Point2f(static_cast<float>(x), static_cast<float>(y));
-                    wristRightMarked = true;
-                    std::cout << "Right wrist boundary marked" << std::endl;
-                }
+                wristMid = cv::Point2f(static_cast<float>(x), static_cast<float>(y));
+                std::cout << "Wrist mid point marked" << std::endl;
             }
             break;
     }
@@ -139,7 +125,7 @@ bool EnhancedManualCalibrator::validateStep(int step) const {
             }
             return tipsCount >= 3;
         }
-        case 4: return wristLeftMarked && wristRightMarked;
+        case 4: return wristMid.x >= 0;
         case 5: return true;
         default: return false;
     }
@@ -210,26 +196,14 @@ void EnhancedManualCalibrator::drawStepUI(cv::Mat& frame) {
             }
             break;
         case 4:
-            stepText = "STEP 5: Mark wrist BOUNDARIES";
-            instructionText = "Click LEFT then RIGHT wrist boundary points - Press N when done";
-            if (wristLeftMarked) {
-                cv::circle(frame, wristLeft, 10, cv::Scalar(255, 0, 0), -1);
-                cv::putText(frame, "Wrist L", 
-                           cv::Point(static_cast<int>(wristLeft.x + 15), 
-                                    static_cast<int>(wristLeft.y)),
-                           cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 1);
-            }
-            if (wristRightMarked) {
-                cv::circle(frame, wristRight, 10, cv::Scalar(0, 0, 255), -1);
-                cv::putText(frame, "Wrist R", 
-                           cv::Point(static_cast<int>(wristRight.x + 15), 
-                                    static_cast<int>(wristRight.y)),
+            stepText = "STEP 5: Mark wrist MID point";
+            instructionText = "Click wrist midpoint (between left and right wrist) - Press N when done";
+            if (wristMid.x >= 0) {
+                cv::circle(frame, wristMid, 10, cv::Scalar(0, 0, 255), -1);
+                cv::putText(frame, "Wrist Mid", 
+                           cv::Point(static_cast<int>(wristMid.x + 15), 
+                                    static_cast<int>(wristMid.y)),
                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
-            }
-            if (wristLeftMarked && wristRightMarked) {
-                cv::line(frame, wristLeft, wristRight, cv::Scalar(255, 200, 0), 3);
-                cv::Point2f wristMid = (wristLeft + wristRight) * 0.5f;
-                cv::circle(frame, wristMid, 6, cv::Scalar(255, 255, 0), -1);
             }
             break;
         case 5:
@@ -268,7 +242,7 @@ bool EnhancedManualCalibrator::processCalibration(int key, cv::Mat& displayFrame
                     case 1: std::cout << "Step 2: Trace palm outline" << std::endl; break;
                     case 2: std::cout << "Step 3: Mark finger bases" << std::endl; break;
                     case 3: std::cout << "Step 4: Mark finger tips" << std::endl; break;
-                    case 4: std::cout << "Step 5: Mark wrist BOUNDARIES" << std::endl; break;
+                    case 4: std::cout << "Step 5: Mark wrist MID point" << std::endl; break;
                     case 5: std::cout << "Step 6: Ready to finalize" << std::endl; break;
                 }
             }
@@ -294,8 +268,6 @@ bool EnhancedManualCalibrator::processCalibration(int key, cv::Mat& displayFrame
                     if (fingerBasesMarked[i]) {
                         fingerBasesMarked[i] = false;
                         fingerBases[i] = cv::Point2f(-1, -1);
-                        if (i == 0) thumbBase = cv::Point2f(-1, -1);
-                        if (i == 4) pinkyBase = cv::Point2f(-1, -1);
                         std::cout << "Cleared " << fingerNames[i] << " base" << std::endl;
                         break;
                     }
@@ -312,15 +284,8 @@ bool EnhancedManualCalibrator::processCalibration(int key, cv::Mat& displayFrame
                 }
                 break;
             case 4: 
-                if (wristRightMarked) {
-                    wristRightMarked = false;
-                    wristRight = cv::Point2f(-1, -1);
-                    std::cout << "Cleared right wrist boundary" << std::endl;
-                } else if (wristLeftMarked) {
-                    wristLeftMarked = false;
-                    wristLeft = cv::Point2f(-1, -1);
-                    std::cout << "Cleared left wrist boundary" << std::endl;
-                }
+                wristMid = cv::Point2f(-1, -1);
+                std::cout << "Cleared wrist mid point" << std::endl;
                 break;
         }
     }
@@ -390,22 +355,7 @@ void EnhancedManualCalibrator::extractHSVFromSamplingRect() {
 }
 
 void EnhancedManualCalibrator::calculateEnhancedRatios() {
-    calibrationData.thumbBase = thumbBase;
-    calibrationData.pinkyBase = pinkyBase;
-    
-    calibrationData.fingerBases.clear();
-    calibrationData.fingerTips.clear();
-    for (int i = 0; i < 5; i++) {
-        if (fingerBasesMarked[i]) {
-            calibrationData.fingerBases.push_back(fingerBases[i]);
-        }
-        if (fingerTipsMarked[i]) {
-            calibrationData.fingerTips.push_back(fingerTips[i]);
-        }
-    }
-    
-    calibrationData.handContour = palmTrace;
-    
+    // Calculate palm center from finger bases
     cv::Point2f palmSum(0, 0);
     int baseCount = 0;
     for (int i = 0; i < 5; i++) {
@@ -418,107 +368,41 @@ void EnhancedManualCalibrator::calculateEnhancedRatios() {
     if (baseCount > 0) {
         calibrationData.palmCenter = palmSum * (1.0f / baseCount);
     } else {
-        calibrationData.palmCenter = (thumbBase + pinkyBase) * 0.5f;
-    }
-    
-    calibrationData.thumbBaseOffset = thumbBase - calibrationData.palmCenter;
-    calibrationData.pinkyBaseOffset = pinkyBase - calibrationData.palmCenter;
-    
-    calibrationData.thumbPinkyBaseWidth = cv::norm(thumbBase - pinkyBase);
-    
-    float maxFingerLength = 0.0f;
-    float totalFingerDistance = 0.0f;
-    int fingerCount = 0;
-    
-    for (int i = 0; i < 5; i++) {
-        if (fingerBasesMarked[i] && fingerTipsMarked[i]) {
-            calibrationData.fingers[i].base = fingerBases[i];
-            calibrationData.fingers[i].tip = fingerTips[i];
-            calibrationData.fingers[i].tipVector = fingerTips[i] - fingerBases[i];
-            calibrationData.fingers[i].baseOffset = fingerBases[i] - calibrationData.palmCenter;
-            calibrationData.fingers[i].length = cv::norm(calibrationData.fingers[i].tipVector);
-            calibrationData.fingers[i].angle = std::atan2(
-                calibrationData.fingers[i].tipVector.y,
-                calibrationData.fingers[i].tipVector.x
-            );
-            calibrationData.fingers[i].isCalibrated = true;
-            
-            maxFingerLength = std::max(maxFingerLength, calibrationData.fingers[i].length);
-            totalFingerDistance += cv::norm(fingerTips[i] - calibrationData.palmCenter);
-            fingerCount++;
-            
-            FingerIdentity identity;
-            identity.id = i;
-            identity.rawTip = fingerTips[i];
-            identity.displayTip = fingerTips[i];
-            identity.isDetected = true;
-            identity.confidence = 1.0f;
-            identity.isLocked = true;
-            
-            calibrationData.fingerIdentities.push_back(identity);
+        // Fallback: average of thumb and pinky bases if available
+        cv::Point2f thumbBase = fingerBasesMarked[0] ? fingerBases[0] : cv::Point2f(-1, -1);
+        cv::Point2f pinkyBase = fingerBasesMarked[4] ? fingerBases[4] : cv::Point2f(-1, -1);
+        if (thumbBase.x >= 0 && pinkyBase.x >= 0) {
+            calibrationData.palmCenter = (thumbBase + pinkyBase) * 0.5f;
         }
     }
     
-    if (fingerCount > 0) {
-        calibrationData.ratios.avgFingerDistance = totalFingerDistance / fingerCount;
-    }
-    
-    if (wristLeftMarked && wristRightMarked) {
-        calibrationData.wrist.left = wristLeft;
-        calibrationData.wrist.right = wristRight;
-        calibrationData.wrist.leftOffset = wristLeft - calibrationData.palmCenter;
-        calibrationData.wrist.rightOffset = wristRight - calibrationData.palmCenter;
-        calibrationData.wrist.width = cv::norm(wristLeft - wristRight);
-        calibrationData.calibratedWristWidth = calibrationData.wrist.width;
-        
-        cv::Point2f wristMid = (wristLeft + wristRight) * 0.5f;
-        calibrationData.wrist.verticalOffset = wristMid.y - calibrationData.palmCenter.y;
+    // Store wrist mid point
+    if (wristMid.x >= 0) {
+        calibrationData.wrist.left = cv::Point2f(wristMid.x - 20, wristMid.y);
+        calibrationData.wrist.right = cv::Point2f(wristMid.x + 20, wristMid.y);
+        calibrationData.wrist.width = 40.0f;
         calibrationData.wrist.isCalibrated = true;
-        
-        calibrationData.calibratedWristDistance = cv::norm(wristMid - calibrationData.palmCenter);
-        
-        if (calibrationData.thumbPinkyBaseWidth > 0) {
-            calibrationData.wristPalmDistanceRatio = calibrationData.calibratedWristDistance / calibrationData.thumbPinkyBaseWidth;
-        }
     }
     
-    if (wristLeftMarked && wristRightMarked) {
-        calibrationData.ratios.thumbToWrist = cv::norm(thumbBase - wristLeft);
-        calibrationData.ratios.pinkyToWrist = cv::norm(pinkyBase - wristRight);
-        calibrationData.ratios.wristWidth = calibrationData.wrist.width;
-    }
-    
-    float thumbDist = cv::norm(thumbBase - calibrationData.palmCenter);
-    float pinkyDist = cv::norm(pinkyBase - calibrationData.palmCenter);
-    calibrationData.ratios.palmRadius = (thumbDist + pinkyDist) * 0.5f;
-    calibrationData.ratios.maxFingerLength = maxFingerLength;
-    
-    std::vector<cv::Point2f> allPoints;
+    // Store finger data
+    calibrationData.fingerBases.clear();
+    calibrationData.fingerTips.clear();
     for (int i = 0; i < 5; i++) {
-        if (fingerBasesMarked[i]) allPoints.push_back(fingerBases[i]);
-        if (fingerTipsMarked[i]) allPoints.push_back(fingerTips[i]);
-    }
-    if (wristLeftMarked) allPoints.push_back(wristLeft);
-    if (wristRightMarked) allPoints.push_back(wristRight);
-    
-    if (!allPoints.empty()) {
-        float minX = allPoints[0].x, maxX = allPoints[0].x;
-        float minY = allPoints[0].y, maxY = allPoints[0].y;
-        
-        for (const auto& p : allPoints) {
-            if (p.x < minX) minX = p.x;
-            if (p.x > maxX) maxX = p.x;
-            if (p.y < minY) minY = p.y;
-            if (p.y > maxY) maxY = p.y;
+        if (fingerBasesMarked[i]) {
+            calibrationData.fingerBases.push_back(fingerBases[i]);
         }
-        
-        calibrationData.ratios.handWidth = maxX - minX;
-        calibrationData.ratios.handHeight = maxY - minY;
+        if (fingerTipsMarked[i]) {
+            calibrationData.fingerTips.push_back(fingerTips[i]);
+        }
     }
     
-    if (palmTrace.size() >= 5) {
-        calibrationData.fittedEllipse = cv::fitEllipse(palmTrace);
-    }
+    calibrationData.handContour = palmTrace;
+    calibrationData.isCalibrated = true;
+    
+    std::cout << "\n=== CALIBRATION COMPLETE ===" << std::endl;
+    std::cout << "Palm center: (" << calibrationData.palmCenter.x << ", " << calibrationData.palmCenter.y << ")" << std::endl;
+    std::cout << "Wrist mid: (" << wristMid.x << ", " << wristMid.y << ")" << std::endl;
+    std::cout << "Fingers calibrated: " << calibrationData.fingerTips.size() << std::endl;
 }
 
 bool EnhancedManualCalibrator::finalizeCalibration() {
@@ -537,13 +421,6 @@ bool EnhancedManualCalibrator::finalizeCalibration() {
     isCalibrated = true;
     geometryUpdater.reset();
     shapeTracker.reset();
-    
-    std::cout << "\n=== CALIBRATION COMPLETE ===" << std::endl;
-    std::cout << "Thumb-Pinky Base Width: " << calibrationData.thumbPinkyBaseWidth << std::endl;
-    std::cout << "Avg Finger Distance: " << calibrationData.ratios.avgFingerDistance << std::endl;
-    std::cout << "Wrist Distance: " << calibrationData.calibratedWristDistance << std::endl;
-    std::cout << "Wrist Width: " << calibrationData.calibratedWristWidth << std::endl;
-    std::cout << "Wrist-Palm Ratio: " << calibrationData.wristPalmDistanceRatio << std::endl;
     
     return true;
 }

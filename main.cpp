@@ -190,15 +190,15 @@ public:
         
         // ----- STEP 4: Shape Anchoring -----
         if (isCalibrated && !shapeTracker.isAnchored() && palmResult.handDetected) {
-            const HandGeometryState& state = geometryUpdater.getState();
+            // Get hand frame for anchoring
+            const auto& handFrame = geometryUpdater.getHandFrame();
             bool anchored = shapeTracker.anchorShape(
                 palmResult.contour,
-                state.palmCenter,
-                state.thumbBase,
-                state.pinkyBase,
-                state.palmRadius,
-                state.avgFingerDistance,
-                state.smoothedHandScale
+                handFrame.palmCenter,
+                handFrame.wristMid,
+                geometryUpdater.getState().palmRadius,  // Pass palm radius
+                100.0f,  // Default finger distance
+                1.0f     // Default scale
             );
             
             if (anchored) {
@@ -219,39 +219,49 @@ private:
     void controlCursorBasedOnFingerState(FastCursorController& cursorController) {
         FingerState fingerState = geometryUpdater.getFingerState();
         
-        if (fingerState == FINGER_STATE_FIST) {
-            cv::Point2f palmPos = geometryUpdater.getPalmCenter();
-            cursorController.move(palmPos, cv::Point2f(-1, -1), cv::Point2f(-1, -1));
-        } else {
-            cv::Point2f middleTip = geometryUpdater.getMiddleFingerTip();
-            cv::Point2f thumbTip = geometryUpdater.getThumbTip();
-            cv::Point2f indexTip = geometryUpdater.getIndexTip();
-            
-            if (middleTip.x >= 0) {
-                cursorController.move(middleTip, thumbTip, indexTip);
+        // Get palm position for cursor control
+        cv::Point2f palmPos = geometryUpdater.getPalmCenter();
+        
+        // Find finger tips for cursor control
+        cv::Point2f middleTip(-1, -1);
+        cv::Point2f thumbTip(-1, -1);
+        cv::Point2f indexTip(-1, -1);
+        
+        const auto& fingers = geometryUpdater.getFingerIdentities();
+        for (const auto& finger : fingers) {
+            if (finger.isDetected) {
+                switch (finger.id) {
+                    case 0: thumbTip = finger.displayTip; break;
+                    case 1: indexTip = finger.displayTip; break;
+                    case 2: middleTip = finger.displayTip; break;
+                }
             }
+        }
+        
+        if (fingerState == FINGER_STATE_FIST) {
+            // Use palm position for cursor in fist state
+            cursorController.move(palmPos, cv::Point2f(-1, -1), cv::Point2f(-1, -1));
+        } else if (middleTip.x >= 0) {
+            // Use middle finger tip for cursor
+            cursorController.move(middleTip, thumbTip, indexTip);
         }
     }
 };
 
 // ==================== HELPER FUNCTIONS IMPLEMENTATIONS ====================
 void printStartupBanner() {
-    std::cout << "Starting Hand Tracker with FINGER STATE AWARENESS" << std::endl;
-    std::cout << "ENHANCEMENTS APPLIED:" << std::endl;
-    std::cout << "1. FINGER STATE CLASSIFICATION: Fist/Partial/Open detection" << std::endl;
-    std::cout << "2. NO FINGER HALLUCINATION: Clean fist handling with reset" << std::endl;
-    std::cout << "3. PARTIAL HAND SUPPORT: Only detected finger count, no forced 5 IDs" << std::endl;
-    std::cout << "4. GEOMETRY CONSISTENCY CHECKS: Suppress face/body blobs without HSV gating" << std::endl;
-    std::cout << "5. ENHANCED CONTOUR ANCHORING: Distance-based projection with no stickiness" << std::endl;
-    std::cout << "6. AGGRESSIVE ADAPTIVE SMOOTHING: Fast motion = 15% smoothing, Still = 70%" << std::endl;
-    std::cout << "7. VELOCITY-ADAPTIVE CURSOR: Fast moves = responsive, slow moves = stable" << std::endl;
-    std::cout << "\n=== STATE-AWARE HAND TRACKER ===" << std::endl;
-    std::cout << "CORE IMPROVEMENTS:" << std::endl;
-    std::cout << "1. Finger State Awareness: Knows when you make a fist" << std::endl;
-    std::cout << "2. No Hallucination: Zero fingers = zero detected fingertips" << std::endl;
-    std::cout << "3. Geometry Filtering: Face/body blobs suppressed by shape analysis" << std::endl;
-    std::cout << "4. Responsive Fast Motion: 15% smoothing during rapid movement" << std::endl;
-    std::cout << "5. Stable Rest: 70% smoothing when hand is still" << std::endl;
+    std::cout << "Starting Hand Tracker with STABLE REFERENCE FRAME" << std::endl;
+    std::cout << "ARCHITECTURAL IMPROVEMENTS:" << std::endl;
+    std::cout << "1. STABLE HAND FRAME: Derived from palm+wrist only" << std::endl;
+    std::cout << "2. NO FEEDBACK LOOPS: Independent smoothing paths" << std::endl;
+    std::cout << "3. ROTATION-INVARIANT: Hand-local finger coordinates" << std::endl;
+    std::cout << "4. HARD IDENTITY LOCKING: 60-frame cooldown periods" << std::endl;
+    std::cout << "\n=== STABLE HAND TRACKER ===" << std::endl;
+    std::cout << "KEY FIXES:" << std::endl;
+    std::cout << "1. Eliminated finger→wrist→finger feedback loop" << std::endl;
+    std::cout << "2. Wrist direction stable under rotation" << std::endl;
+    std::cout << "3. Finger IDs locked during small movements" << std::endl;
+    std::cout << "4. Angle continuity with unwrapping (no π flips)" << std::endl;
     std::cout << "\nControls:" << std::endl;
     std::cout << "C: Start calibration" << std::endl;
     std::cout << "T: Toggle cursor" << std::endl;
@@ -306,7 +316,6 @@ void maintainFrameRate(std::chrono::steady_clock::time_point frameStart) {
 }
 
 // ==================== MAIN APPLICATION ====================
-// ==================== MAIN APPLICATION ====================
 int main() {
     // ----- INITIALIZATION -----
     printStartupBanner();
@@ -324,7 +333,7 @@ int main() {
     FrameProcessor frameProcessor;
     EnhancedManualCalibrator calibrator;
     
-    cv::namedWindow("Hand Tracker - State Aware");
+    cv::namedWindow("Hand Tracker - Stable Frame");
     
     // ----- MAIN LOOP -----
     cv::Mat frame;
@@ -351,7 +360,7 @@ int main() {
         if (calibrator.isCalibrating()) {
             static bool mouseCallbackSet = false;
             if (!mouseCallbackSet) {
-                cv::setMouseCallback("Hand Tracker - State Aware", [](int event, int x, int y, int flags, void* userdata) {
+                cv::setMouseCallback("Hand Tracker - Stable Frame", [](int event, int x, int y, int flags, void* userdata) {
                     EnhancedManualCalibrator* cal = static_cast<EnhancedManualCalibrator*>(userdata);
                     cal->handleMouse(event, x, y);
                 }, &calibrator);
@@ -364,7 +373,7 @@ int main() {
                 isCalibrated = true;
                 geometryUpdater.reset();
                 shapeTracker.reset();
-                cv::setMouseCallback("Hand Tracker - State Aware", nullptr, nullptr);
+                cv::setMouseCallback("Hand Tracker - Stable Frame", nullptr, nullptr);
                 mouseCallbackSet = false;
                 
                 if (isCalibrated) {
@@ -372,7 +381,7 @@ int main() {
                 }
             }
             
-            cv::imshow("Hand Tracker - State Aware", displayFrame);
+            cv::imshow("Hand Tracker - Stable Frame", displayFrame);
             
             if (shouldExitProgram(key)) {
                 programRunning = false;
@@ -380,7 +389,7 @@ int main() {
             }
             continue;
         } else {
-            cv::setMouseCallback("Hand Tracker - State Aware", nullptr, nullptr);
+            cv::setMouseCallback("Hand Tracker - Stable Frame", nullptr, nullptr);
         }
         
         // ----- PIPELINE EXECUTION -----
@@ -394,7 +403,7 @@ int main() {
         updateAndDisplayFPS(frame, frameCounter, fps, lastFPSUpdate);
         
         // ----- RENDERING -----
-        cv::imshow("Hand Tracker - State Aware", frame);
+        cv::imshow("Hand Tracker - Stable Frame", frame);
         
         // ----- EXIT CHECK -----
         if (shouldExitProgram(key)) {

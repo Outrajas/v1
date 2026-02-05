@@ -19,17 +19,12 @@ private:
     cv::Rect hsvSamplingRect;
     std::vector<cv::Point> palmTrace;
     
-    cv::Point2f thumbBase;
-    cv::Point2f pinkyBase;
-    cv::Point2f wristLeft;
-    cv::Point2f wristRight;
+    cv::Point2f wristMid;  // Changed from left/right to single mid point
     
     cv::Point2f fingerTips[5];
     cv::Point2f fingerBases[5];
     bool fingerTipsMarked[5] = {false};
     bool fingerBasesMarked[5] = {false};
-    bool wristLeftMarked = false;
-    bool wristRightMarked = false;
     
     std::string fingerNames[5] = {"Thumb", "Index", "Middle", "Ring", "Pinky"};
     

@@ -1,13 +1,13 @@
 #include "PalmEstimator.h"
 #include <algorithm>
 #include <iostream>
-#include "TemporalSmoother.h" 
+
 // External declarations from main.cpp
 extern cv::Point2f lastValidPalm;
 extern cv::Point2f lastValidThumbBase;
 extern cv::Point2f lastValidPinkyBase;
 extern int failureFrameCount;
-extern std::atomic<bool> isCalibrated;  // Changed from bool to std::atomic<bool>
+extern std::atomic<bool> isCalibrated;
 extern CalibrationResult calibrationData;
 extern GeometryUpdater geometryUpdater;
 extern ShapeAnchoredTracker shapeTracker;
@@ -58,17 +58,6 @@ PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat&
                         std::sqrt(area / M_PI));
                     score *= (1.0f + geometryScore * 0.5f);
                     
-                    // Enhanced: Check hand rotation consistency
-                    if (geometryUpdater.getState().handFrame.palmCenter.x >= 0) {
-                        const auto& handFrame = geometryUpdater.getHandFrame();
-                        cv::Point2f localCenter = handFrame.toHandLocal(contourCenter);
-                        float centerDist = cv::norm(localCenter);
-                        
-                        if (centerDist < 100.0f) {
-                            score += 300.0f; // Bonus for being near expected position
-                        }
-                    }
-                    
                     if (isCalibrated) {
                         float distFromCalibrated = cv::norm(contourCenter - calibrationData.palmCenter);
                         if (distFromCalibrated < 200) {
@@ -107,47 +96,39 @@ PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat&
         result.aspectRatio = aspect;
         result.solidity = solidity;
         
-        if (!fitContourToModel(result.contour, result.palm, result.thumbBase, 
-                              result.pinkyBase, result.handSizeScale)) {
-            result.status = "Geometry fitting failed, using HSV";
+        // Fit contour and estimate wrist position
+        cv::Point2f wristMid;
+        if (!fitContourToModel(result.contour, result.palm, wristMid, result.handSizeScale)) {
+            result.status = "Geometry fitting failed";
+        } else {
+            // Store wrist position
+            result.wristMid = wristMid;
         }
         
-        result.fingerTips = detectFingerTips(result.contour, result.palm);
-        
-        geometryUpdater.updateGeometry(result.palm, result.thumbBase, result.pinkyBase,
-                                     result.fingerTips, result.handSizeScale, 
-                                     result.contour);
+        // Update geometry with independent paths
+        geometryUpdater.updateGeometry(result.palm, wristMid, 
+                                      cv::Point2f(-1, -1), cv::Point2f(-1, -1),
+                                      result.contour);
         
         if (geometryUpdater.isPalmValid()) {
             result.smoothedPalm = geometryUpdater.getPalmCenter();
+            result.smoothedWristMid = geometryUpdater.getWristMid();
             result.handDetected = true;
-        }
-        
-        float anatConfidence = geometryUpdater.getAnatomicalConfidence();
-        float overallConfidence = geometryUpdater.getOverallConfidence();
-        
-        std::string stateStr;
-        switch (geometryUpdater.getFingerState()) {
-            case FINGER_STATE_FIST: stateStr = " (fist)"; break;
-            case FINGER_STATE_PARTIAL: stateStr = " (partial)"; break;
-            case FINGER_STATE_OPEN: stateStr = " (open)"; break;
-        }
-        
-        // Enhanced confidence reporting with hand rotation info
-        std::string rotationInfo = "";
-        if (geometryUpdater.getState().handRotationVelocity > 0.1f) {
-            rotationInfo = " [rotating]";
-        }
-        
-        if (anatConfidence > 0.7f) {
-            result.status = "Hand (stable)" + stateStr + rotationInfo;
-            result.confidence = overallConfidence;
-        } else if (anatConfidence > 0.3f) {
-            result.status = "Hand (correcting)" + stateStr + rotationInfo;
-            result.confidence = overallConfidence * 0.7f;
-        } else {
-            result.status = "Hand (low anatomy)" + stateStr + rotationInfo;
-            result.confidence = overallConfidence * 0.4f;
+            
+            // Get finger state
+            result.fingerState = geometryUpdater.getFingerState();
+            result.detectedFingerCount = geometryUpdater.getDetectedFingerCount();
+            
+            // Build status string
+            std::string stateStr;
+            switch (result.fingerState) {
+                case FINGER_STATE_FIST: stateStr = " (fist)"; break;
+                case FINGER_STATE_PARTIAL: stateStr = " (partial)"; break;
+                case FINGER_STATE_OPEN: stateStr = " (open)"; break;
+            }
+            
+            result.status = "Hand" + stateStr;
+            result.confidence = 0.8f;  // Basic confidence
         }
         
     } catch (const cv::Exception& e) {
@@ -196,28 +177,6 @@ bool PalmEstimator::validatePalmShape(const std::vector<cv::Point>& contour, con
     
     float geometryScore = computeGeometryConsistencyScore(contour, palmCenter, mean);
     if (geometryScore < 0.3f) {
-        return false;
-    }
-    
-    // Enhanced: Check for reasonable finger count based on convexity defects
-    std::vector<int> hullIndices;
-    cv::convexHull(contour, hullIndices, false, false);
-    
-    std::vector<cv::Vec4i> defects;
-    if (hullIndices.size() > 3) {
-        cv::convexityDefects(contour, hullIndices, defects);
-    }
-    
-    int validDefects = 0;
-    for (const auto& defect : defects) {
-        float depth = defect[3] / 256.0f;
-        if (depth > mean * MIN_DEFECT_DEPTH_RATIO) {
-            validDefects++;
-        }
-    }
-    
-    // Reject contours that look like faces/arms (too many defects or too few)
-    if (validDefects > 8 || (validDefects == 0 && contour.size() > 100)) {
         return false;
     }
     
@@ -289,14 +248,7 @@ float PalmEstimator::computeGeometryConsistencyScore(const std::vector<cv::Point
                        std::max(1.0f, std::min(ellipse.size.width, ellipse.size.height));
     float aspectScore = std::min(1.0f, aspectRatio / 2.0f);
     
-    // Enhanced: Check finger spread consistency
-    float spreadScore = 0.0f;
-    if (validDefects >= 2) {
-        float avgDefectDepth = totalDefectDepth / validDefects;
-        spreadScore = std::min(1.0f, avgDefectDepth / (palmRadius * 0.3f));
-    }
-    
-    return defectScore * 0.4f + symmetryScore * 0.2f + aspectScore * 0.2f + spreadScore * 0.2f;
+    return defectScore * 0.5f + symmetryScore * 0.3f + aspectScore * 0.2f;
 }
 
 bool PalmEstimator::couldBeHand(const std::vector<cv::Point>& contour, float& aspect, float& solidity) {
@@ -343,14 +295,12 @@ bool PalmEstimator::couldBeHand(const std::vector<cv::Point>& contour, float& as
 
 bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour, 
                                      cv::Point2f& palmCenter,
-                                     cv::Point2f& thumbBase,
-                                     cv::Point2f& pinkyBase,
+                                     cv::Point2f& wristMid,
                                      float& handSizeScale) {
     if (contour.size() < 8) {
         if (failureFrameCount < PE_MAX_FAILURE_FRAMES && lastValidPalm.x >= 0) {
             palmCenter = lastValidPalm;
-            thumbBase = lastValidThumbBase;
-            pinkyBase = lastValidPinkyBase;
+            wristMid = cv::Point2f(palmCenter.x, palmCenter.y + 100);  // Default below palm
             handSizeScale = 1.0f;
             failureFrameCount++;
             return true;
@@ -361,8 +311,7 @@ bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour,
     if (m.m00 == 0) {
         if (failureFrameCount < PE_MAX_FAILURE_FRAMES && lastValidPalm.x >= 0) {
             palmCenter = lastValidPalm;
-            thumbBase = lastValidThumbBase;
-            pinkyBase = lastValidPinkyBase;
+            wristMid = cv::Point2f(palmCenter.x, palmCenter.y + 100);
             handSizeScale = 1.0f;
             failureFrameCount++;
             return true;
@@ -370,18 +319,35 @@ bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour,
         if (!contour.empty()) {
             cv::Rect bbox = cv::boundingRect(contour);
             palmCenter = cv::Point2f(bbox.x + bbox.width/2.0f, bbox.y + bbox.height/2.0f);
+            wristMid = cv::Point2f(palmCenter.x, bbox.y + bbox.height);
         }
     } else {
         palmCenter = cv::Point2f(
             static_cast<float>(m.m10 / m.m00),
             static_cast<float>(m.m01 / m.m00)
         );
+        
+        // Estimate wrist position as lowest point of contour
+        int lowestY = contour[0].y;
+        cv::Point lowestPoint = contour[0];
+        
+        for (const auto& p : contour) {
+            if (p.y > lowestY) {
+                lowestY = p.y;
+                lowestPoint = p;
+            }
+        }
+        
+        wristMid = cv::Point2f(static_cast<float>(lowestPoint.x), 
+                              static_cast<float>(lowestPoint.y));
+        
+        // Adjust wrist to be below palm
+        if (wristMid.y < palmCenter.y + 20) {
+            wristMid.y = palmCenter.y + 100;  // Force reasonable distance
+        }
     }
     
-    // Enhanced: Use temporal smoother for palm center
-    static TemporalSmoother palmSmoother;
-    palmCenter = palmSmoother.smoothWithJerkLimit(palmCenter);
-    
+    // Limit palm center jumps
     if (lastValidPalm.x >= 0) {
         float jumpDist = cv::norm(palmCenter - lastValidPalm);
         if (jumpDist > PE_MAX_PALM_CENTER_JUMP && jumpDist > 0.001f) {
@@ -390,36 +356,14 @@ bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour,
         }
     }
     
-    if (contour.size() > 8) {
-        cv::Point leftmost = contour[0];
-        cv::Point rightmost = contour[0];
-        
-        for (const auto& p : contour) {
-            if (p.x < leftmost.x) leftmost = p;
-            if (p.x > rightmost.x) rightmost = p;
-        }
-        
-        thumbBase = cv::Point2f(static_cast<float>(leftmost.x), static_cast<float>(leftmost.y));
-        pinkyBase = cv::Point2f(static_cast<float>(rightmost.x), static_cast<float>(rightmost.y));
-    }
-    
     handSizeScale = 1.0f;
     if (isCalibrated && calibrationData.ratios.handWidth > 0) {
-        float currentWidth = cv::norm(thumbBase - pinkyBase);
+        // Simple scale estimation
+        cv::Rect bbox = cv::boundingRect(contour);
+        float currentWidth = static_cast<float>(bbox.width);
         float calibratedWidth = calibrationData.ratios.handWidth;
         
-        float lowerBound = calibratedWidth * PE_DISTANCE_LOWER_BOUND;
-        float upperBound = calibratedWidth * PE_DISTANCE_UPPER_BOUND;
-        
-        float clampedWidth = currentWidth;
-        if (clampedWidth < lowerBound) {
-            clampedWidth = lowerBound * 0.3f + currentWidth * 0.7f;
-        }
-        if (clampedWidth > upperBound) {
-            clampedWidth = upperBound * 0.3f + currentWidth * 0.7f;
-        }
-        
-        handSizeScale = clampedWidth / calibratedWidth;
+        handSizeScale = currentWidth / calibratedWidth;
         
         if (handSizeScale < 0.25f) handSizeScale = 0.25f;
         if (handSizeScale > 3.5f) handSizeScale = 3.5f;
@@ -428,8 +372,7 @@ bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour,
     if (!validatePalmShape(contour, palmCenter)) {
         if (failureFrameCount < PE_MAX_FAILURE_FRAMES && lastValidPalm.x >= 0) {
             palmCenter = lastValidPalm;
-            thumbBase = lastValidThumbBase;
-            pinkyBase = lastValidPinkyBase;
+            wristMid = cv::Point2f(palmCenter.x, palmCenter.y + 100);
             handSizeScale = 1.0f;
             failureFrameCount++;
             return true;
@@ -438,47 +381,9 @@ bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour,
     }
     
     lastValidPalm = palmCenter;
-    lastValidThumbBase = thumbBase;
-    lastValidPinkyBase = pinkyBase;
     failureFrameCount = 0;
     
     return true;
-}
-
-std::vector<cv::Point2f> PalmEstimator::detectFingerTips(const std::vector<cv::Point>& contour, const cv::Point2f& palmCenter) {
-    std::vector<cv::Point2f> fingerTips;
-    
-    if (contour.empty() || palmCenter.x < 0) return fingerTips;
-    
-    std::vector<cv::Point> hull;
-    cv::convexHull(contour, hull, false);
-    
-    std::vector<cv::Point2f> candidates;
-    for (const auto& p : hull) {
-        cv::Point2f point(p);
-        float dist = cv::norm(point - palmCenter);
-        
-        float minDist = (isCalibrated ? calibrationData.ratios.palmRadius * 0.8f : 30.0f);
-        float maxDist = (isCalibrated ? calibrationData.ratios.maxFingerLength * 1.5f : 150.0f);
-        
-        if (dist >= minDist && dist <= maxDist) {
-            if (point.y < palmCenter.y + dist * 0.5f) {
-                candidates.push_back(point);
-            }
-        }
-    }
-    
-    std::sort(candidates.begin(), candidates.end(),
-        [](const cv::Point2f& a, const cv::Point2f& b) {
-            return a.y < b.y;
-        });
-    
-    int maxFingers = std::min(5, static_cast<int>(candidates.size()));
-    for (int i = 0; i < maxFingers; i++) {
-        fingerTips.push_back(candidates[i]);
-    }
-    
-    return fingerTips;
 }
 
 void PalmEstimator::draw(cv::Mat& frame, const Result& result, 
@@ -504,17 +409,31 @@ void PalmEstimator::draw(cv::Mat& frame, const Result& result,
                     0, cv::Scalar(100, 100, 100), 1);
             }
             
-            const HandGeometryState& state = geometryUpdater.getState();
+            // Draw palm center
+            cv::Point2f palmCenter = geometryUpdater.getPalmCenter();
+            cv::circle(frame, palmCenter, 8, cv::Scalar(0, 255, 255), -1);
             
-            cv::circle(frame, state.smoothedPalmCenter, 8, cv::Scalar(0, 255, 255), -1);
+            // Draw wrist
+            cv::Point2f wristMid = geometryUpdater.getWristMid();
+            if (wristMid.x >= 0) {
+                cv::circle(frame, wristMid, 8, cv::Scalar(255, 0, 0), -1);
+                cv::line(frame, palmCenter, wristMid, cv::Scalar(255, 0, 0), 2);
+                
+                // Draw hand reference frame
+                const auto& handFrame = geometryUpdater.getHandFrame();
+                cv::Point2f axisEnd = palmCenter + handFrame.primaryAxis * 50.0f;
+                cv::Point2f lateralEnd = palmCenter + handFrame.secondaryAxis * 50.0f;
+                
+                cv::arrowedLine(frame, palmCenter, axisEnd, cv::Scalar(0, 255, 0), 2);
+                cv::arrowedLine(frame, palmCenter, lateralEnd, cv::Scalar(255, 0, 0), 2);
+                
+                cv::putText(frame, "Primary", axisEnd + cv::Point2f(5, 5),
+                          cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
+                cv::putText(frame, "Lateral", lateralEnd + cv::Point2f(5, 5),
+                          cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 0, 0), 1);
+            }
             
-            // Draw hand reference frame
-            cv::Point2f wristDirEnd = state.palmCenter + state.handFrame.wristDirection * 50.0f;
-            cv::Point2f lateralDirEnd = state.palmCenter + state.handFrame.lateralDirection * 50.0f;
-            
-            cv::arrowedLine(frame, state.palmCenter, wristDirEnd, cv::Scalar(0, 255, 0), 2);
-            cv::arrowedLine(frame, state.palmCenter, lateralDirEnd, cv::Scalar(255, 0, 0), 2);
-            
+            // Draw fingers
             const auto& fingers = geometryUpdater.getFingerIdentities();
             for (const auto& finger : fingers) {
                 if (finger.isDetected) {
@@ -546,111 +465,67 @@ void PalmEstimator::draw(cv::Mat& frame, const Result& result,
                             fingerName = "?";
                             break;
                     }
+                    
                     cv::circle(frame, finger.displayTip, 6, color, -1);
                     
                     cv::putText(frame, fingerName, 
                               finger.displayTip + cv::Point2f(8, -10),
                               cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
                     
-                    float dist = cv::norm(finger.displayTip - state.smoothedPalmCenter);
-                    cv::line(frame, state.smoothedPalmCenter, finger.displayTip,
+                    // Draw line to palm
+                    cv::line(frame, palmCenter, finger.displayTip,
                              cv::Scalar(200, 200, 200), 1);
                     
-                    cv::putText(frame,
-                        std::to_string((int)dist),
-                        finger.displayTip + cv::Point2f(5, 15),
-                        cv::FONT_HERSHEY_SIMPLEX,
-                        0.4,
-                        cv::Scalar(255, 255, 255),
-                        1
-                    );
-                    
+                    // Show lock status
                     std::string status = finger.isLocked ? "L" : std::to_string((int)(finger.confidence * 100));
-                    cv::putText(frame,
-                        status + "%",
-                        finger.displayTip + cv::Point2f(5, 30),
-                        cv::FONT_HERSHEY_SIMPLEX,
-                        0.4,
-                        finger.isLocked ? cv::Scalar(0, 255, 0) : cv::Scalar(200, 200, 200),
-                        1
-                    );
-                    
-                    // Draw hand-local coordinates
-                    cv::Point2f localPos = state.toCamera(finger.handLocalTip);
-                    cv::circle(frame, localPos, 3, cv::Scalar(255, 255, 0), -1);
+                    cv::putText(frame, status + "%",
+                              finger.displayTip + cv::Point2f(5, 30),
+                              cv::FONT_HERSHEY_SIMPLEX, 0.4,
+                              finger.isLocked ? cv::Scalar(0, 255, 0) : cv::Scalar(200, 200, 200),
+                              1);
                 }
             }
             
-            if (state.smoothedWristLeft.x >= 0 && state.smoothedWristRight.x >= 0) {
-                cv::line(frame, state.smoothedWristLeft, state.smoothedWristRight, 
-                        cv::Scalar(255, 0, 0), 2);
-                
-                cv::circle(frame, state.smoothedWristLeft, 8, cv::Scalar(255, 0, 0), -1);
-                cv::circle(frame, state.smoothedWristRight, 8, cv::Scalar(255, 0, 0), -1);
-                cv::circle(frame, state.wristMid, 6, cv::Scalar(0, 255, 255), -1);
-                
-                cv::putText(frame, "Wrist L", 
-                          state.smoothedWristLeft + cv::Point2f(10, 0),
-                          cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 1);
-                cv::putText(frame, "Wrist R", 
-                          state.smoothedWristRight + cv::Point2f(10, 0),
-                          cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 1);
-                cv::putText(frame, "Wrist Mid", 
-                          state.wristMid + cv::Point2f(10, 0),
-                          cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
-                
-                if (cv::norm(state.lastWristDir) > 0.001f) {
-                    cv::Point2f wristDir = state.lastWristDir;
-                    cv::Point2f lateralDir(-wristDir.y, wristDir.x);
-                    cv::Point2f cutoffStart = state.wristMid - lateralDir * 100;
-                    cv::Point2f cutoffEnd = state.wristMid + lateralDir * 100;
-                    cv::line(frame, cutoffStart, cutoffEnd, 
-                            cv::Scalar(255, 100, 100), 1, cv::LINE_AA);
-                }
+            // Draw wrist boundaries
+            cv::Point2f wristLeft = geometryUpdater.getWristLeft();
+            cv::Point2f wristRight = geometryUpdater.getWristRight();
+            
+            if (wristLeft.x >= 0 && wristRight.x >= 0) {
+                cv::line(frame, wristLeft, wristRight, cv::Scalar(255, 0, 0), 2);
+                cv::circle(frame, wristLeft, 6, cv::Scalar(255, 0, 0), -1);
+                cv::circle(frame, wristRight, 6, cv::Scalar(255, 0, 0), -1);
             }
             
+            // Status info
             std::string stateInfo;
             switch (geometryUpdater.getFingerState()) {
                 case FINGER_STATE_FIST: stateInfo = "FIST"; break;
                 case FINGER_STATE_PARTIAL: stateInfo = "PARTIAL"; break;
                 case FINGER_STATE_OPEN: stateInfo = "OPEN"; break;
             }
+            
             stateInfo += " | Fingers: " + std::to_string(geometryUpdater.getDetectedFingerCount());
-            stateInfo += " | Conf: " + std::to_string((int)(geometryUpdater.getOverallConfidence() * 100)) + "%";
-            stateInfo += " | Sm: " + std::to_string((int)(state.currentSmoothingAlpha * 100)) + "%";
-            stateInfo += " | Rot: " + std::to_string((int)(state.handRotation * 180.0f / M_PI)) + "°";
-            if (state.hsvIsRelaxed) {
-                stateInfo += " HSV-R";
-            }
             cv::putText(frame, stateInfo, 
-                      state.smoothedPalmCenter + cv::Point2f(-60, -30),
+                      palmCenter + cv::Point2f(-60, -30),
                       cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 200), 1);
         }
     }
     
+    // Status overlay
     cv::rectangle(frame, cv::Rect(0, 0, 640, 80), cv::Scalar(0, 0, 0, 180), -1);
     
     std::string status = result.handDetected ? result.status : result.status;
-    cv::Scalar statusColor = result.handDetected ? 
-        (geometryUpdater.getAnatomicalConfidence() > 0.7f ? cv::Scalar(0, 255, 0) : cv::Scalar(255, 165, 0)) : 
-        cv::Scalar(0, 0, 255);
+    cv::Scalar statusColor = result.handDetected ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255);
     
     cv::putText(frame, status, cv::Point(10, 25), 
                cv::FONT_HERSHEY_SIMPLEX, 0.7, statusColor, 2);
     
     if (result.handDetected) {
         std::string info = "Area: " + std::to_string((int)result.area) +
-                          " | Fingers: " + std::to_string(geometryUpdater.getFingerIdentities().size()) +
-                          " | Anat: " + std::to_string((int)(geometryUpdater.getAnatomicalConfidence() * 100)) + "%" +
-                          " | RotVel: " + std::to_string((int)(geometryUpdater.getState().handRotationVelocity * 180.0f / M_PI)) + "°/f";
+                          " | Fingers: " + std::to_string(geometryUpdater.getDetectedFingerCount());
         cv::putText(frame, info, cv::Point(10, 50),
                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 200), 1);
     }
-    
-    std::string cursorStatus = true ? "CURSOR: ON" : "CURSOR: OFF";
-    cv::Scalar cursorColor = true ? cv::Scalar(0, 255, 0) : cv::Scalar(100, 100, 255);
-    cv::putText(frame, cursorStatus, cv::Point(640 - 120, 50),
-               cv::FONT_HERSHEY_SIMPLEX, 0.5, cursorColor, 1);
     
     std::string controls = "C: Calibrate | T: Toggle | ESC: Exit";
     if (isCalibrated) {
