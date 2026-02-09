@@ -165,8 +165,6 @@ private:
 };
 
 // ==================== FRAME PROCESSING ====================
-// ==================== FRAME PROCESSING ====================
-// ==================== FRAME PROCESSING ====================
 class FrameProcessor {
     MotionEstimator motionEstimator;
     SkinExtractor skinExtractor;

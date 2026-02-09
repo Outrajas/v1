@@ -404,7 +404,7 @@ struct HandGeometryState {
     // STEP 1: Thumb & Pinky Base Extraction (from contour only)
     std::pair<cv::Point2f, cv::Point2f> findThumbPinkyBasesFromContour();
     
-    // STEP 2-4: Wrist Computation Pipeline
+    // STEP 2-4: Wrist Computation Pipeline - NOW CONSUMES AUTHORITATIVE INPUT
     void computeWristFromBases(const cv::Point2f& thumbBase, const cv::Point2f& pinkyBase);
     
     // Anti-drift continuity
@@ -447,6 +447,7 @@ struct HandGeometryState {
     cv::Point2f getPinkyBase() const { return pinkyBase; }
 };
 
+
 class GeometryUpdater {
 private:
     HandGeometryState currentState;
@@ -470,12 +471,12 @@ public:
         lastThumbPinkyWidth = 0.0f;
     }
     
-    // Main update - NO feedback loops, IGNORES input wrist
+    // Main update - CONSUMES AUTHORITATIVE wrist geometry from PalmEstimator
     void updateGeometry(const cv::Point2f& rawPalmCenter,
-                       const cv::Point2f& rawWristMid,
-                       const cv::Point2f& rawWristLeft,
-                       const cv::Point2f& rawWristRight,
-                       const std::vector<cv::Point>& contour);
+                       const cv::Point2f& authoritativeWristMid,
+                       const cv::Point2f& authoritativeWristLeft,
+                       const cv::Point2f& authoritativeWristRight,
+                       const std::vector<cv::Point>& constrainedContour);
     
     const HandGeometryState& getState() const { return currentState; }
     bool isPalmValid() const { return currentState.isPalmValid(); }
@@ -533,5 +534,4 @@ public:
     cv::Point2f getThumbBase() const { return currentState.getThumbBase(); }
     cv::Point2f getPinkyBase() const { return currentState.getPinkyBase(); }
 };
-
 #endif

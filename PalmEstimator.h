@@ -26,15 +26,23 @@ public:
     struct Result {
         cv::Point2f palm{-1,-1};          // REQUIRED: contour-validated palm center
         cv::Point2f wristHint{-1,-1};     // NON-AUTHORITATIVE: GeometryUpdater ignores this
+        
+        // AUTHORITATIVE WRIST GEOMETRY (2-point line model)
+        cv::Point2f wristLeft{-1,-1};
+        cv::Point2f wristRight{-1,-1};
+        cv::Point2f wristMid{-1,-1};
+        
         bool handDetected = false;
-        std::vector<cv::Point> contour;
+        std::vector<cv::Point> contour;          // Raw HSV contour
+        std::vector<cv::Point> constrainedContour; // Wrist-constrained contour
+        
         cv::Rect boundingBox;
         double area = 0;
         std::string status;
         
         float aspectRatio = 0;
         float solidity = 0;
-        float confidence = 0;
+        float confidence = 0;  // Wrist geometry confidence
         
         int contoursFound = 0;
         int potentialHands = 0;
@@ -56,7 +64,14 @@ public:
                                          const cv::Point2f& palmCenter, float palmRadius);
     bool couldBeHand(const std::vector<cv::Point>& contour, float& aspect, float& solidity);
     
-    // New: Only computes palm center, NO WRIST GEOMETRY
+    // Wrist computation pipeline - SOFT VERSION (returns confidence, never fails)
+    float computeWristGeometry(const std::vector<cv::Point>& rawContour,
+                             cv::Point2f& wristLeft,
+                             cv::Point2f& wristRight,
+                             cv::Point2f& wristMid,
+                             std::vector<cv::Point>& constrainedContour);
+    
+    // Palm center from constrained contour - NEVER FAILS
     bool fitContourToModel(std::vector<cv::Point>& contour, 
                           cv::Point2f& palmCenter,
                           float& handSizeScale);
@@ -70,6 +85,14 @@ private:
     cv::Point2f projectPointToContourInterior(const cv::Point2f& point, 
                                               const std::vector<cv::Point>& contour,
                                               const cv::Point2f& fallback) const;
+    
+    // Wrist computation helpers
+    std::pair<int, int> findThumbPinkyDefects(const std::vector<cv::Point>& contour,
+                                             const std::vector<cv::Vec4i>& defects) const;
+    std::vector<cv::Point> constrainContourWithWrist(const std::vector<cv::Point>& rawContour,
+                                                    const cv::Point2f& wristLeft,
+                                                    const cv::Point2f& wristRight,
+                                                    float wristConfidence) const;
 };
 
 #endif

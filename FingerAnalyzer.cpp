@@ -207,9 +207,9 @@ std::pair<cv::Point2f, cv::Point2f> HandGeometryState::findThumbPinkyBasesFromCo
     return {foundThumbBase, foundPinkyBase};
 }
 
-// STEP 2-4: Wrist Computation Pipeline
+// STEP 2-4: Wrist Computation Pipeline - CONSUMES AUTHORITATIVE INPUT
 void HandGeometryState::computeWristFromBases(const cv::Point2f& thumbBase, const cv::Point2f& pinkyBase) {
-    // Case: No valid bases
+    // Case: No valid bases - use fallback decay
     if (thumbBase.x < 0 || pinkyBase.x < 0) {
         // Case: Hand re-entering frame or catastrophic loss
         // Use last valid wrist with decay toward palm center
@@ -229,69 +229,14 @@ void HandGeometryState::computeWristFromBases(const cv::Point2f& thumbBase, cons
         return;
     }
     
-    // STEP 2: Wrist Normal Direction (NO AMBIGUITY)
-    cv::Point2f TP = pinkyBase - thumbBase;
-    float tpWidth = cv::norm(TP);
+    // THIS FUNCTION NO LONGER COMPUTES WRIST - ONLY PROCESSES AUTHORITATIVE INPUT
+    // Wrist geometry is provided by PalmEstimator, we only manage decay and smoothing
     
-    if (tpWidth < FA_MIN_THUMB_PINKY_WIDTH) {
-        // Case: Depth change or occlusion
-        // Use last valid width with scaling
-        tpWidth = std::max(FA_MIN_THUMB_PINKY_WIDTH, lastValidThumbPinkyWidth);
-    }
+    // Store bases for temporal continuity
+    lastValidThumbBase = thumbBase;
+    lastValidPinkyBase = pinkyBase;
     
-    cv::Point2f TP_dir = TP * (1.0f / tpWidth);
-    cv::Point2f TP_perp(-TP_dir.y, TP_dir.x);  // Perpendicular (90 deg CCW)
-    
-    // Disambiguate sign using last wrist
-    if (lastValidWristMid.x >= 0 && palmCenter.x >= 0) {
-        cv::Point2f lastWristDir = lastValidWristMid - palmCenter;
-        if (lastWristDir.dot(TP_perp) < 0) {
-            TP_perp = -TP_perp;  // Flip to match previous orientation
-        }
-    }
-    
-    // STEP 3: Wrist Mid (DISTANCE-BOUND)
-    float expectedDistRatio = 0.8f;  // Default ratio
-    float expectedDist = expectedDistRatio * tpWidth;
-    
-    // Apply min/max constraints
-    float minDist = FA_WRIST_DISTANCE_RATIO_MIN * tpWidth;
-    float maxDist = FA_WRIST_DISTANCE_RATIO_MAX * tpWidth;
-    
-    if (expectedDist < minDist) expectedDist = minDist;
-    if (expectedDist > maxDist) expectedDist = maxDist;
-    
-    cv::Point2f wristMidCandidate = palmCenter + TP_perp * expectedDist;
-    
-    // Ensure wrist mid is inside contour
-    wristMidCandidate = projectPointToContourInterior(wristMidCandidate, wristMidCandidate);
-    
-    // Case: Fast rotation or contour deformation
-    if (!isPointInContour(wristMidCandidate) || wristMidCandidate.x < 0) {
-        // Fallback to last valid wrist mid
-        if (lastValidWristMid.x >= 0) {
-            wristMidCandidate = lastValidWristMid;
-        }
-    }
-    
-    // STEP 4: Wrist Left & Right (PRIMARY GEOMETRY)
-    float wristHalfWidth = FA_WRIST_WIDTH_RATIO * tpWidth * 0.5f;
-    
-    wristLeft = wristMidCandidate - TP_dir * wristHalfWidth;
-    wristRight = wristMidCandidate + TP_dir * wristHalfWidth;
-    
-    // Enforce contour inclusion for both points
-    wristLeft = projectPointToContourInterior(wristLeft, wristLeft);
-    wristRight = projectPointToContourInterior(wristRight, wristRight);
-    
-    // Recompute wrist mid from left/right (ensures consistency)
-    wristMid = (wristLeft + wristRight) * 0.5f;
-    
-    // Store as last valid
-    lastValidWristLeft = wristLeft;
-    lastValidWristRight = wristRight;
-    lastValidWristMid = wristMid;
-    lastValidThumbPinkyWidth = tpWidth;
+    // Note: wristLeft, wristRight, wristMid are set by updateRawGeometry from authoritative input
 }
 
 // Anti-drift continuity
@@ -326,7 +271,7 @@ void HandGeometryState::applyTemporalContinuity(const cv::Point2f& newPalmCenter
     // Case: Fast rotation
     else if (std::abs(rotationAngle) > 0.5f) {
         // Allow angular change but preserve distance ratios
-        // Already handled by computeWristFromBases
+        // Already handled by authoritative wrist input
     }
     // Case: Hand leaving frame
     else if (deltaCMag > 100.0f) {
@@ -663,11 +608,8 @@ void HandGeometryState::updateRawGeometry(const cv::Point2f& palm, const std::ve
     thumbBase = bases.first;
     pinkyBase = bases.second;
     
-    // DATA FLOW: Bases → Wrist LEFT & RIGHT (PRIMARY)
-    computeWristFromBases(thumbBase, pinkyBase);
-    
-    // DATA FLOW: Wrist left/right → Wrist MID (DERIVED)
-    // Already computed in computeWristFromBases
+    // Note: Wrist geometry is now provided by PalmEstimator via updateGeometry
+    // We no longer compute wrist here
 }
 
 void HandGeometryState::smoothPalmCenter() {
@@ -1135,18 +1077,34 @@ void HandGeometryState::updateValidity(bool newValid) {
     }
 }
 
-// GeometryUpdater methods
+// GeometryUpdater methods - CONSUMES AUTHORITATIVE wrist geometry
 void GeometryUpdater::updateGeometry(const cv::Point2f& rawPalmCenter,
-                                   const cv::Point2f& rawWristMid,
-                                   const cv::Point2f& rawWristLeft,
-                                   const cv::Point2f& rawWristRight,
-                                   const std::vector<cv::Point>& contour) {
-    // IGNORE input wrist completely - rebuild from scratch
+                                   const cv::Point2f& authoritativeWristMid,
+                                   const cv::Point2f& authoritativeWristLeft,
+                                   const cv::Point2f& authoritativeWristRight,
+                                   const std::vector<cv::Point>& constrainedContour) {
+    // USE AUTHORITATIVE wrist geometry from PalmEstimator (NO RECOMPUTATION)
+    currentState.updateRawGeometry(rawPalmCenter, constrainedContour);
     
-    // Store raw inputs (only palm center and contour)
-    currentState.updateRawGeometry(rawPalmCenter, contour);
+    // Override internal wrist computation with authoritative values
+    if (authoritativeWristLeft.x >= 0 && authoritativeWristRight.x >= 0) {
+        currentState.wristLeft = authoritativeWristLeft;
+        currentState.wristRight = authoritativeWristRight;
+        
+        if (authoritativeWristMid.x >= 0) {
+            currentState.wristMid = authoritativeWristMid;
+        } else {
+            // Compute mid from left/right if not provided
+            currentState.wristMid = (authoritativeWristLeft + authoritativeWristRight) * 0.5f;
+        }
+        
+        // Update last valid wrist
+        currentState.lastValidWristLeft = authoritativeWristLeft;
+        currentState.lastValidWristRight = authoritativeWristRight;
+        currentState.lastValidWristMid = currentState.wristMid;
+    }
     
-    // Compute rotation angle for anti-drift
+    // Compute rotation angle for anti-drift (using authoritative wrist)
     float rotationAngle = 0.0f;
     if (lastThumbBase.x >= 0 && lastPinkyBase.x >= 0 &&
         currentState.thumbBase.x >= 0 && currentState.pinkyBase.x >= 0) {
@@ -1174,14 +1132,14 @@ void GeometryUpdater::updateGeometry(const cv::Point2f& rawPalmCenter,
     
     // Independent smoothing paths (NO CROSS-DEPENDENCIES)
     currentState.smoothPalmCenter();
-    currentState.smoothWristGeometry();  // Smooths left/right independently
+    currentState.smoothWristGeometry();  // Smooths authoritative left/right
     
-    // Update hand reference frame (based on smoothed geometry)
+    // Update hand reference frame (based on smoothed authoritative geometry)
     currentState.updateHandReferenceFrame();
     
     // Update finger tracking (in hand-local space only)
     currentState.updateFingerTracking();
     
     // Update validity
-    currentState.updateValidity(!contour.empty());
+    currentState.updateValidity(!constrainedContour.empty());
 }

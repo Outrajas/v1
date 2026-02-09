@@ -447,7 +447,7 @@ bool EnhancedManualCalibrator::isWristOppositeFingers() const {
     
     fingerCentroid = fingerCentroid * (1.0f / baseCount);
     
-    // Calculate wrist midpoint
+    // Calculate wrist midpoint (computed on demand)
     cv::Point2f wristMid = (wristLeft + wristRight) * 0.5f;
     
     // Vectors from palm center (estimated)
@@ -455,9 +455,6 @@ bool EnhancedManualCalibrator::isWristOppositeFingers() const {
     cv::Point2f wristVector = wristMid - fingerCentroid;
     
     // Dot product should be positive if wrist is opposite fingers
-    // In practice, we check if wrist is on the opposite side of palm relative to fingers
-    // For a typical hand, wrist should be below fingers in image coordinates
-    // But we'll use a simpler check: wrist should not be in the same direction as fingers
     float dotProduct = fingerVector.dot(wristVector);
     bool isOpposite = dotProduct < 0;
     
