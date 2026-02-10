@@ -1,3 +1,4 @@
+// PalmEstimator.h
 #ifndef PALM_ESTIMATOR_H
 #define PALM_ESTIMATOR_H
 
@@ -34,7 +35,7 @@ public:
         
         bool handDetected = false;
         std::vector<cv::Point> contour;          // Raw HSV contour
-        std::vector<cv::Point> constrainedContour; // Wrist-constrained contour
+        std::vector<cv::Point> constrainedContour; // Sculpted contour (Iteration 2)
         
         cv::Rect boundingBox;
         double area = 0;
@@ -64,12 +65,18 @@ public:
                                          const cv::Point2f& palmCenter, float palmRadius);
     bool couldBeHand(const std::vector<cv::Point>& contour, float& aspect, float& solidity);
     
-    // Wrist computation pipeline - SOFT VERSION (returns confidence, never fails)
+    // PURE WRIST ESTIMATION - NO TRIMMING (Iteration 2 correction)
     float computeWristGeometry(const std::vector<cv::Point>& rawContour,
                              cv::Point2f& wristLeft,
                              cv::Point2f& wristRight,
-                             cv::Point2f& wristMid,
-                             std::vector<cv::Point>& constrainedContour);
+                             cv::Point2f& wristMid);
+    
+    // ENHANCED SHAPE SCULPTING (Iteration 2)
+    std::vector<cv::Point> constrainContourWithWrist(const std::vector<cv::Point>& rawContour,
+                                                   const cv::Point2f& wristLeft,
+                                                   const cv::Point2f& wristRight,
+                                                   const cv::Point2f& wristMid,
+                                                   float wristConfidence) const;
     
     // Palm center from constrained contour - NEVER FAILS
     bool fitContourToModel(std::vector<cv::Point>& contour, 
@@ -89,10 +96,23 @@ private:
     // Wrist computation helpers
     std::pair<int, int> findThumbPinkyDefects(const std::vector<cv::Point>& contour,
                                              const std::vector<cv::Vec4i>& defects) const;
-    std::vector<cv::Point> constrainContourWithWrist(const std::vector<cv::Point>& rawContour,
+    
+    // ITERATION 2: Shape sculpting helper functions
+    std::vector<cv::Point> applyWristLineTrimming(const std::vector<cv::Point>& contour,
+                                                const cv::Point2f& wristLeft,
+                                                const cv::Point2f& wristRight,
+                                                float wristConfidence) const;
+    
+    std::vector<cv::Point> applyLobeLimiting(const std::vector<cv::Point>& contour,
+                                           float confidence) const;
+    
+    std::vector<cv::Point> applyWidthConsistencyCheck(const std::vector<cv::Point>& contour,
                                                     const cv::Point2f& wristLeft,
                                                     const cv::Point2f& wristRight,
-                                                    float wristConfidence) const;
+                                                    float confidence) const;
+    
+    std::vector<cv::Point> applyCalibrationBiasedRefinement(const std::vector<cv::Point>& contour,
+                                                          float confidence) const;
 };
 
 #endif

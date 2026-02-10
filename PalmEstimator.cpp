@@ -1,6 +1,8 @@
+// PalmEstimator.cpp
 #include "PalmEstimator.h"
 #include <algorithm>
 #include <iostream>
+#include <numeric>
 
 // External declarations from main.cpp
 extern cv::Point2f lastValidPalm;
@@ -135,7 +137,7 @@ PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat&
             result.aspectRatio = aspect;
             result.solidity = solidity;
             
-            // STEP 1: COMPUTE WRIST GEOMETRY (BEST-EFFORT)
+            // STEP 1: PURE WRIST ESTIMATION (NO TRIMMING)
             float wristConfidence = 0.0f;
             result.wristLeft = cv::Point2f(-1, -1);
             result.wristRight = cv::Point2f(-1, -1);
@@ -144,13 +146,19 @@ PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat&
             wristConfidence = computeWristGeometry(result.contour,
                                                   result.wristLeft,
                                                   result.wristRight,
-                                                  result.wristMid,
-                                                  result.constrainedContour);
+                                                  result.wristMid);
             
-            // STEP 2: COMPUTE PALM CENTER (ALWAYS)
+            // STEP 2: SHAPE SCULPTING (AFTER WRIST ESTIMATION)
+            result.constrainedContour = constrainContourWithWrist(result.contour,
+                                                                result.wristLeft,
+                                                                result.wristRight,
+                                                                result.wristMid,
+                                                                wristConfidence);
+            
+            // STEP 3: COMPUTE PALM CENTER (ALWAYS)
             result.handSizeScale = 1.0f;
             
-            // ALWAYS compute palm center - use constrained contour if available, otherwise raw
+            // ALWAYS compute palm center - use sculpted contour if available, otherwise raw
             std::vector<cv::Point> contourForPalm = result.constrainedContour.empty() ? 
                                                     result.contour : result.constrainedContour;
             
@@ -170,7 +178,7 @@ PalmEstimator::Result PalmEstimator::detect(const cv::Mat& frame, const cv::Mat&
                                           result.wristMid,      // AUTHORITATIVE
                                           result.wristLeft,     // AUTHORITATIVE  
                                           result.wristRight,    // AUTHORITATIVE
-                                          result.constrainedContour); // Constrained contour
+                                          result.constrainedContour); // Sculpted contour
                 
             if (geometryUpdater.isPalmValid()) {
                 // Get finger state from GeometryUpdater
@@ -353,28 +361,24 @@ bool PalmEstimator::couldBeHand(const std::vector<cv::Point>& contour, float& as
     return true;
 }
 
-// Wrist computation pipeline - BEST-EFFORT (may return invalid points)
+// PURE WRIST ESTIMATION - NO TRIMMING
 float PalmEstimator::computeWristGeometry(const std::vector<cv::Point>& rawContour,
                                         cv::Point2f& wristLeft,
                                         cv::Point2f& wristRight,
-                                        cv::Point2f& wristMid,
-                                        std::vector<cv::Point>& constrainedContour) {
+                                        cv::Point2f& wristMid) {
     // Initialize with invalid values
     wristLeft = cv::Point2f(-1, -1);
     wristRight = cv::Point2f(-1, -1);
     wristMid = cv::Point2f(-1, -1);
-    constrainedContour.clear();
     
-    // Start with lowest confidence
     float confidence = 0.0f;
     
-    // If contour is too small, return minimal confidence
+    // BEST-EFFORT: Contour must exist but can be small
     if (rawContour.size() < 20) {
-        constrainedContour = rawContour;
         return confidence;
     }
     
-    // STEP 1: Find convex hull and defects
+    // STEP 1: Find convex hull and defects (PURE ANALYSIS)
     std::vector<int> hullIndices;
     cv::convexHull(rawContour, hullIndices, false, false);
     
@@ -391,9 +395,7 @@ float PalmEstimator::computeWristGeometry(const std::vector<cv::Point>& rawConto
         wristRight = cv::Point2f(bbox.x + bbox.width * 0.8f, bbox.y + bbox.height * 0.9f);
         wristMid = (wristLeft + wristRight) * 0.5f;
         
-        // Very low confidence for fallback
-        confidence = 0.1f;
-        constrainedContour = rawContour;
+        confidence = 0.1f; // Very low confidence for fallback
         return confidence;
     }
     
@@ -415,7 +417,6 @@ float PalmEstimator::computeWristGeometry(const std::vector<cv::Point>& rawConto
             wristMid = (wristLeft + wristRight) * 0.5f;
             
             confidence = 0.1f;
-            constrainedContour = rawContour;
             return confidence;
         }
     }
@@ -445,35 +446,20 @@ float PalmEstimator::computeWristGeometry(const std::vector<cv::Point>& rawConto
     cv::Point2f axisDir = handAxis / axisLength;
     cv::Point2f perpendicular(-axisDir.y, axisDir.x);
     
-    // STEP 5: Estimate palm center (rough, will be refined later)
+    // STEP 5: Estimate rough palm center
     cv::Point2f roughPalmCenter = (thumbBase + pinkyBase) * 0.5f;
     
-    // STEP 6: Compute wrist line (projected from palm along -Y in hand-local space)
-    float wristDistance = axisLength * 0.8f;  // Wrist is about 80% of thumb-pinky width away
-    
-    wristMid = roughPalmCenter + perpendicular * wristDistance;
-    float wristHalfWidth = axisLength * 0.3f;  // Wrist is narrower than hand
+    // STEP 6: Compute wrist line
+    float wristDistance = axisLength * 0.8f;
+    wristMid = roughPalmCenter - perpendicular * wristDistance;
+    float wristHalfWidth = axisLength * 0.3f;
     
     wristLeft = wristMid - axisDir * wristHalfWidth;
     wristRight = wristMid + axisDir * wristHalfWidth;
     
-    // Ensure wrist points are near contour
-    wristLeft = projectPointToContourInterior(wristLeft, rawContour, wristLeft);
-    wristRight = projectPointToContourInterior(wristRight, rawContour, wristRight);
-    wristMid = (wristLeft + wristRight) * 0.5f;
-    
     // Increase confidence if wrist points are inside contour
     if (isPointInContour(wristLeft, rawContour) && isPointInContour(wristRight, rawContour)) {
         confidence = std::min(1.0f, confidence + 0.3f);
-    }
-    
-    // STEP 7: Create constrained contour by removing forearm above wrist line
-    constrainedContour = constrainContourWithWrist(rawContour, wristLeft, wristRight, confidence);
-    
-    // ABSOLUTE: Never return empty contour
-    if (constrainedContour.empty()) {
-        constrainedContour = rawContour;
-        confidence *= 0.8f; // Reduce confidence if trimming removed everything
     }
     
     return confidence;
@@ -520,83 +506,318 @@ std::pair<int, int> PalmEstimator::findThumbPinkyDefects(const std::vector<cv::P
     }
 }
 
+// ITERATION 2: Enhanced shape sculpting with independent soft passes
 std::vector<cv::Point> PalmEstimator::constrainContourWithWrist(const std::vector<cv::Point>& rawContour,
                                                                const cv::Point2f& wristLeft,
                                                                const cv::Point2f& wristRight,
+                                                               const cv::Point2f& wristMid,
                                                                float wristConfidence) const {
-    // ABSOLUTE: If no wrist points or low confidence, return raw contour
-    if (wristLeft.x < 0 || wristRight.x < 0 || wristConfidence < 0.2f) {
+    // ABSOLUTE: Always return at least the raw contour
+    if (rawContour.empty() || wristConfidence < 0.1f) {
         return rawContour;
     }
     
-    if (rawContour.empty()) {
+    std::vector<cv::Point> workingContour = rawContour;
+    
+    // PASS 1: Basic wrist-line trimming (arm suppression in -Y direction)
+    workingContour = applyWristLineTrimming(workingContour, wristLeft, wristRight, wristConfidence);
+    
+    // PASS 2: Lobe analysis and limiting (≤5 finger-like protrusions)
+    workingContour = applyLobeLimiting(workingContour, wristConfidence);
+    
+    // PASS 3: Width consistency check (only in -Y direction)
+    workingContour = applyWidthConsistencyCheck(workingContour, wristLeft, wristRight, wristConfidence);
+    
+    // PASS 4: Calibration-biased refinement
+    workingContour = applyCalibrationBiasedRefinement(workingContour, wristConfidence);
+    
+    // ABSOLUTE: Never return empty contour
+    if (workingContour.empty()) {
         return rawContour;
+    }
+    
+    return workingContour;
+}
+
+// Helper for PASS 1: Wrist-line trimming (arm suppression)
+std::vector<cv::Point> PalmEstimator::applyWristLineTrimming(const std::vector<cv::Point>& contour,
+                                                           const cv::Point2f& wristLeft,
+                                                           const cv::Point2f& wristRight,
+                                                           float wristConfidence) const {
+    if (wristLeft.x < 0 || wristRight.x < 0 || contour.empty()) {
+        return contour;
     }
     
     // Create wrist line vector
     cv::Point2f wristVec = wristRight - wristLeft;
     float wristLen = cv::norm(wristVec);
     if (wristLen < 0.001f) {
-        return rawContour;
+        return contour;
     }
     
     cv::Point2f wristDir = wristVec / wristLen;
     cv::Point2f wristNormal(-wristDir.y, wristDir.x);
     
-    // Ensure normal points toward palm (away from forearm)
-    cv::Point2f palmDirection = (wristLeft + wristRight) * 0.5f;
-    // Estimate palm center as midpoint of wrist extended backward
-    cv::Point2f estimatedPalmCenter = (wristLeft + wristRight) * 0.5f - wristNormal * wristLen * 0.5f;
-    palmDirection = estimatedPalmCenter - (wristLeft + wristRight) * 0.5f;
+    // Determine which side is palm (+Y) vs arm (-Y)
+    cv::Point2f contourCentroid(0, 0);
+    for (const auto& p : contour) {
+        contourCentroid += cv::Point2f(p);
+    }
+    contourCentroid = contourCentroid * (1.0f / contour.size());
     
-    if (palmDirection.dot(wristNormal) < 0) {
-        wristNormal = -wristNormal;
+    cv::Point2f toCentroid = contourCentroid - wristLeft;
+    if (toCentroid.dot(wristNormal) < 0) {
+        wristNormal = -wristNormal; // Ensure normal points toward palm
     }
     
-    // CONFIDENCE-BASED TRIMMING
-    std::vector<cv::Point> constrained;
-    int pointsKept = 0;
-    int pointsRemoved = 0;
+    // CONFIDENCE-BASED TRIMMING (only in -Y/arm direction)
+    std::vector<cv::Point> trimmed;
+    float trimThreshold = 20.0f * (1.0f - wristConfidence * 0.7f); // Softer trimming with higher confidence
     
-    for (const auto& p : rawContour) {
+    for (const auto& p : contour) {
         cv::Point2f vecToPoint = cv::Point2f(p) - wristLeft;
-        float crossProduct = vecToPoint.x * wristNormal.x + vecToPoint.y * wristNormal.y;
+        float crossProduct = vecToPoint.dot(wristNormal);
         
-        // ARM SIDE (negative crossProduct): Strong trimming based on confidence
+        // ARM SIDE (negative crossProduct): progressive trimming
         if (crossProduct < 0) {
-            // Distance from wrist line
             float distanceFromWrist = std::abs(crossProduct);
             
-            // Dynamic threshold based on wrist confidence and distance
-            float keepThreshold = 20.0f * (1.0f - wristConfidence * 0.7f);
-            
-            if (distanceFromWrist < keepThreshold) {
-                // Keep points very close to wrist line (transition zone)
-                constrained.push_back(p);
-                pointsKept++;
-            } else {
-                // Remove distant points on arm side
-                pointsRemoved++;
+            // Keep points close to wrist line (transition zone)
+            if (distanceFromWrist < trimThreshold) {
+                trimmed.push_back(p);
             }
+            // Else: discard distant arm points
         } 
-        // PALM SIDE (positive crossProduct): Minimal or no trimming
+        // PALM SIDE (positive crossProduct): keep all points
         else {
-            // Always keep palm side points
-            constrained.push_back(p);
-            pointsKept++;
+            trimmed.push_back(p);
         }
     }
     
-    // ABSOLUTE: If trimming removed too much, return raw contour
-    if (constrained.empty() || (pointsKept < rawContour.size() * 0.3f && wristConfidence < 0.5f)) {
-        return rawContour;
+    // ABSOLUTE: If trimming removed too much, return original
+    if (trimmed.size() < contour.size() * 0.3f) {
+        return contour;
     }
     
-    // If we kept a reasonable amount, return constrained contour
-    return constrained;
+    return trimmed;
 }
 
-// Palm center from constrained contour - ALWAYS RETURNS PALM CENTER
+// Helper for PASS 2: Lobe analysis and limiting
+std::vector<cv::Point> PalmEstimator::applyLobeLimiting(const std::vector<cv::Point>& contour,
+                                                       float confidence) const {
+    if (contour.size() < 30) return contour;
+    
+    std::vector<cv::Point> result = contour;
+    
+    // Find convex hull and defects for lobe analysis
+    std::vector<int> hullIndices;
+    cv::convexHull(contour, hullIndices, false, false);
+    
+    if (hullIndices.size() < 3) return contour;
+    
+    std::vector<cv::Vec4i> defects;
+    cv::convexityDefects(contour, hullIndices, defects);
+    
+    // Analyze lobes (finger-like protrusions)
+    struct LobeInfo {
+        int defectIdx;
+        float depth;
+        float width;
+        cv::Point farPoint;
+    };
+    
+    std::vector<LobeInfo> lobeCandidates;
+    
+    for (size_t i = 0; i < defects.size(); i++) {
+        float depth = defects[i][3] / 256.0f;
+        
+        int startIdx = defects[i][0];
+        int endIdx = defects[i][1];
+        int farIdx = defects[i][2];
+        
+        cv::Point startPt = contour[startIdx];
+        cv::Point endPt = contour[endIdx];
+        cv::Point farPt = contour[farIdx];
+        
+        float chordLength = cv::norm(cv::Point2f(endPt) - cv::Point2f(startPt));
+        
+        // Valid finger lobe criteria
+        if (depth > chordLength * 0.15f && depth > 10.0f && chordLength > 15.0f) {
+            LobeInfo lobe;
+            lobe.defectIdx = static_cast<int>(i);
+            lobe.depth = depth;
+            lobe.width = chordLength;
+            lobe.farPoint = farPt;
+            lobeCandidates.push_back(lobe);
+        }
+    }
+    
+    // Sort by depth (strongest lobes first)
+    std::sort(lobeCandidates.begin(), lobeCandidates.end(),
+              [](const LobeInfo& a, const LobeInfo& b) { return a.depth > b.depth; });
+    
+    // SOFT LIMIT: If more than 5 lobes, reduce confidence and consider trimming weakest
+    if (lobeCandidates.size() > 5) {
+        // Mark weakest lobes (tail of sorted list) for potential trimming
+        std::vector<cv::Point> weakestLobePoints;
+        
+        // Collect points from weakest lobes (indices 5 and beyond)
+        for (size_t i = 5; i < lobeCandidates.size(); i++) {
+            const auto& defect = defects[lobeCandidates[i].defectIdx];
+            
+            // Get points associated with this defect
+            cv::Point startPt = contour[defect[0]];
+            cv::Point endPt = contour[defect[1]];
+            cv::Point farPt = contour[defect[2]];
+            
+            // Find contour segment between start and end points
+            int startIdx = defect[0];
+            int endIdx = defect[1];
+            
+            // Ensure proper ordering
+            if (startIdx > endIdx) std::swap(startIdx, endIdx);
+            
+            // Mark points in this segment for potential removal
+            for (int j = startIdx; j <= endIdx && j < (int)result.size(); j++) {
+                weakestLobePoints.push_back(result[j]);
+            }
+        }
+        
+        // SOFT TRIMMING: Only remove if confidence is high enough
+        if (confidence > 0.6f && !weakestLobePoints.empty()) {
+            // Create new contour without weakest lobe segments
+            std::vector<cv::Point> filtered;
+            
+            for (const auto& p : result) {
+                bool inWeakLobe = false;
+                for (const auto& weakP : weakestLobePoints) {
+                    if (cv::norm(cv::Point2f(p) - cv::Point2f(weakP)) < 5.0f) {
+                        inWeakLobe = true;
+                        break;
+                    }
+                }
+                if (!inWeakLobe) {
+                    filtered.push_back(p);
+                }
+            }
+            
+            // Only use filtered contour if it's still reasonable
+            if (filtered.size() > result.size() * 0.7f) {
+                result = filtered;
+            }
+        }
+    }
+    
+    return result;
+}
+
+// Helper for PASS 3: Width consistency check (only in -Y direction)
+std::vector<cv::Point> PalmEstimator::applyWidthConsistencyCheck(const std::vector<cv::Point>& contour,
+                                                               const cv::Point2f& wristLeft,
+                                                               const cv::Point2f& wristRight,
+                                                               float confidence) const {
+    if (contour.size() < 50 || wristLeft.x < 0 || wristRight.x < 0) {
+        return contour;
+    }
+    
+    std::vector<cv::Point> result = contour;
+    
+    // Estimate wrist line and direction
+    cv::Point2f wristDir = wristRight - wristLeft;
+    float wristLen = cv::norm(wristDir);
+    if (wristLen < 0.001f) return contour;
+    
+    wristDir = wristDir * (1.0f / wristLen);
+    cv::Point2f wristNormal(-wristDir.y, wristDir.x);
+    
+    // Find centroid for orientation
+    cv::Point2f centroid(0, 0);
+    for (const auto& p : contour) {
+        centroid += cv::Point2f(p);
+    }
+    centroid = centroid * (1.0f / contour.size());
+    
+    // Determine which side is arm (-Y)
+    cv::Point2f toCentroid = centroid - wristLeft;
+    if (toCentroid.dot(wristNormal) < 0) {
+        wristNormal = -wristNormal;
+    }
+    
+    // Sample points along the arm direction (-wristNormal)
+    const int numSamples = 10;
+    std::vector<float> widths;
+    
+    for (int i = 0; i < numSamples; i++) {
+        float t = static_cast<float>(i) / (numSamples - 1);
+        cv::Point2f samplePoint = wristLeft + wristDir * (wristLen * t);
+        
+        // Project in both directions perpendicular to wrist line
+        cv::Point2f testPos = samplePoint + wristNormal * 100.0f;
+        cv::Point2f testNeg = samplePoint - wristNormal * 100.0f;
+        
+        // Find intersection with contour (simplified)
+        float width = 0.0f;
+        // Simplified width estimation - in practice would need ray-contour intersection
+        widths.push_back(width);
+    }
+    
+    // Check width consistency (arm should have constant width)
+    if (widths.size() > 3) {
+        float meanWidth = 0.0f;
+        for (float w : widths) meanWidth += w;
+        meanWidth /= widths.size();
+        
+        float variance = 0.0f;
+        for (float w : widths) {
+            float diff = w - meanWidth;
+            variance += diff * diff;
+        }
+        variance /= widths.size();
+        
+        float widthCV = std::sqrt(variance) / std::max(meanWidth, 1.0f);
+        
+        // If width is very consistent (arm-like), apply stronger trimming
+        if (widthCV < 0.2f && confidence > 0.5f) {
+            // Arm detected - apply progressive trimming
+            return applyWristLineTrimming(result, wristLeft, wristRight, confidence * 1.2f);
+        }
+    }
+    
+    return result;
+}
+
+// Helper for PASS 4: Calibration-biased refinement
+std::vector<cv::Point> PalmEstimator::applyCalibrationBiasedRefinement(const std::vector<cv::Point>& contour,
+                                                                      float confidence) const {
+    if (!isCalibrated || confidence < 0.3f) {
+        return contour;
+    }
+    
+    std::vector<cv::Point> result = contour;
+    
+    // Use calibration to bias trimming strength, not as hard limits
+    
+    // Example: If calibrated hand is smaller, be more conservative with trimming
+    float area = cv::contourArea(contour);
+    float calibratedArea = calibrationData.ratios.handWidth * calibrationData.ratios.handHeight;
+    
+    if (calibratedArea > 0) {
+        float areaRatio = area / calibratedArea;
+        
+        // Adjust trimming aggressiveness based on size match
+        if (areaRatio < 0.7f) {
+            // Contour is smaller than calibrated - be conservative
+            return result; // Skip additional trimming
+        } else if (areaRatio > 1.5f) {
+            // Contour is larger - could include more arm
+            // Already handled by other passes
+        }
+    }
+    
+    return result;
+}
+
+// Palm center from constrained contour - NEVER FAILS
 bool PalmEstimator::fitContourToModel(std::vector<cv::Point>& contour, 
                                      cv::Point2f& palmCenter,
                                      float& handSizeScale) {

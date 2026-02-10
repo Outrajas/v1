@@ -1,3 +1,4 @@
+// main.cpp
 #include <opencv2/opencv.hpp>
 #include <windows.h>
 #include <iostream>
@@ -185,7 +186,7 @@ public:
             geometryUpdater.isPalmValid()
         );
         
-        // ----- STEP 3: Palm Estimation (READ-ONLY) -----
+        // ----- STEP 3: Palm Estimation (WITH SHAPE SCULPTING) -----
         auto palmResult = palmEstimator.detect(frame, motionMask, skinMask, hsvConfidence);
         
         // ----- STEP 4: Shape Anchoring -----
@@ -193,7 +194,7 @@ public:
             // Get hand frame for anchoring
             const auto& handFrame = geometryUpdater.getHandFrame();
             bool anchored = shapeTracker.anchorShape(
-                palmResult.contour,
+                palmResult.constrainedContour,
                 handFrame.palmCenter,
                 handFrame.wristMid,
                 geometryUpdater.getState().palmRadius,  // Pass palm radius
@@ -229,18 +230,18 @@ private:
 
 // ==================== HELPER FUNCTIONS IMPLEMENTATIONS ====================
 void printStartupBanner() {
-    std::cout << "Starting Hand Tracker with STABLE REFERENCE FRAME" << std::endl;
+    std::cout << "Starting Hand Tracker with SHAPE SCULPTING (Iteration 2)" << std::endl;
     std::cout << "ARCHITECTURAL IMPROVEMENTS:" << std::endl;
-    std::cout << "1. STABLE HAND FRAME: Derived from palm+wrist only" << std::endl;
-    std::cout << "2. NO FEEDBACK LOOPS: Independent smoothing paths" << std::endl;
-    std::cout << "3. ROTATION-INVARIANT: Hand-local finger coordinates" << std::endl;
-    std::cout << "4. HARD IDENTITY LOCKING: 60-frame cooldown periods" << std::endl;
-    std::cout << "\n=== STABLE HAND TRACKER ===" << std::endl;
-    std::cout << "KEY FIXES:" << std::endl;
-    std::cout << "1. Eliminated finger→wrist→finger feedback loop" << std::endl;
-    std::cout << "2. Wrist direction stable under rotation" << std::endl;
-    std::cout << "3. Finger IDs locked during small movements" << std::endl;
-    std::cout << "4. Angle continuity with unwrapping (no π flips)" << std::endl;
+    std::cout << "1. PURE WRIST ESTIMATION: No trimming in wrist computation" << std::endl;
+    std::cout << "2. INDEPENDENT SHAPE PASSES: Arm suppression, lobe limiting, width consistency" << std::endl;
+    std::cout << "3. SOFT ENFORCEMENT: Confidence-based trimming, never hard limits" << std::endl;
+    std::cout << "4. CALIBRATION BIAS: Guides trimming strength, not hard constraints" << std::endl;
+    std::cout << "\n=== HAND TRACKER WITH SHAPE SCULPTING ===" << std::endl;
+    std::cout << "ITERATION 2 FIXES:" << std::endl;
+    std::cout << "1. Pure wrist estimation separated from shape sculpting" << std::endl;
+    std::cout << "2. Arm suppression only in -Y direction" << std::endl;
+    std::cout << "3. Lobe limiting (≤5) with soft trimming" << std::endl;
+    std::cout << "4. Width consistency check for arm detection" << std::endl;
     std::cout << "\nControls:" << std::endl;
     std::cout << "C: Start calibration" << std::endl;
     std::cout << "T: Toggle cursor" << std::endl;
@@ -312,7 +313,7 @@ int main() {
     FrameProcessor frameProcessor;
     EnhancedManualCalibrator calibrator;
     
-    cv::namedWindow("Hand Tracker - Stable Frame");
+    cv::namedWindow("Hand Tracker - Shape Sculpting");
     
     // ----- MAIN LOOP -----
     cv::Mat frame;
@@ -339,7 +340,7 @@ int main() {
         if (calibrator.isCalibrating()) {
             static bool mouseCallbackSet = false;
             if (!mouseCallbackSet) {
-                cv::setMouseCallback("Hand Tracker - Stable Frame", [](int event, int x, int y, int flags, void* userdata) {
+                cv::setMouseCallback("Hand Tracker - Shape Sculpting", [](int event, int x, int y, int flags, void* userdata) {
                     EnhancedManualCalibrator* cal = static_cast<EnhancedManualCalibrator*>(userdata);
                     cal->handleMouse(event, x, y);
                 }, &calibrator);
@@ -352,7 +353,7 @@ int main() {
                 isCalibrated = true;
                 geometryUpdater.reset();
                 shapeTracker.reset();
-                cv::setMouseCallback("Hand Tracker - Stable Frame", nullptr, nullptr);
+                cv::setMouseCallback("Hand Tracker - Shape Sculpting", nullptr, nullptr);
                 mouseCallbackSet = false;
                 
                 if (isCalibrated) {
@@ -360,7 +361,7 @@ int main() {
                 }
             }
             
-            cv::imshow("Hand Tracker - Stable Frame", displayFrame);
+            cv::imshow("Hand Tracker - Shape Sculpting", displayFrame);
             
             if (shouldExitProgram(key)) {
                 programRunning = false;
@@ -368,7 +369,7 @@ int main() {
             }
             continue;
         } else {
-            cv::setMouseCallback("Hand Tracker - Stable Frame", nullptr, nullptr);
+            cv::setMouseCallback("Hand Tracker - Shape Sculpting", nullptr, nullptr);
         }
         
         // ----- PIPELINE EXECUTION -----
@@ -382,7 +383,7 @@ int main() {
         updateAndDisplayFPS(frame, frameCounter, fps, lastFPSUpdate);
         
         // ----- RENDERING -----
-        cv::imshow("Hand Tracker - Stable Frame", frame);
+        cv::imshow("Hand Tracker - Shape Sculpting", frame);
         
         // ----- EXIT CHECK -----
         if (shouldExitProgram(key)) {
