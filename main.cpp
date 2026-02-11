@@ -230,18 +230,14 @@ private:
 
 // ==================== HELPER FUNCTIONS IMPLEMENTATIONS ====================
 void printStartupBanner() {
-    std::cout << "Starting Hand Tracker with SHAPE SCULPTING (Iteration 2)" << std::endl;
+    std::cout << "Starting Hand Tracker with SHAPE SCULPTING (Iteration 3 - COMPLETE AUTHORITY REWRITE)" << std::endl;
     std::cout << "ARCHITECTURAL IMPROVEMENTS:" << std::endl;
     std::cout << "1. PURE WRIST ESTIMATION: No trimming in wrist computation" << std::endl;
-    std::cout << "2. INDEPENDENT SHAPE PASSES: Arm suppression, lobe limiting, width consistency" << std::endl;
-    std::cout << "3. SOFT ENFORCEMENT: Confidence-based trimming, never hard limits" << std::endl;
-    std::cout << "4. CALIBRATION BIAS: Guides trimming strength, not hard constraints" << std::endl;
-    std::cout << "\n=== HAND TRACKER WITH SHAPE SCULPTING ===" << std::endl;
-    std::cout << "ITERATION 2 FIXES:" << std::endl;
-    std::cout << "1. Pure wrist estimation separated from shape sculpting" << std::endl;
-    std::cout << "2. Arm suppression only in -Y direction" << std::endl;
-    std::cout << "3. Lobe limiting (≤5) with soft trimming" << std::endl;
-    std::cout << "4. Width consistency check for arm detection" << std::endl;
+    std::cout << "2. UNIFIED SMOOTHING AUTHORITY: PalmEstimator sole smoothing owner" << std::endl;
+    std::cout << "3. HYSTERESIS FREEZE GATING: Confidence-based freeze states" << std::endl;
+    std::cout << "4. TEMPORAL CONFIDENCE: Velocity-based confidence reduction" << std::endl;
+    std::cout << "5. FULL DEBUG OVERLAY: Real-time confidence, alpha, freeze visualization" << std::endl;
+    std::cout << "\n=== HAND TRACKER WITH SHAPE SCULPTING - ITERATION 3 ===" << std::endl;
     std::cout << "\nControls:" << std::endl;
     std::cout << "C: Start calibration" << std::endl;
     std::cout << "T: Toggle cursor" << std::endl;

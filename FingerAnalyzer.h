@@ -359,7 +359,7 @@ struct HandGeometryState {
     float palmRadius = 0.0f;
     float thumbPinkyBaseWidth = 0.0f;
     
-    // Smoothed outputs (separate paths, no cross-dependencies)
+    // Smoothed outputs - NOW SET DIRECTLY BY PALMESTIMATOR, NOT SMOOTHED HERE
     cv::Point2f smoothedPalmCenter = cv::Point2f(-1, -1);
     cv::Point2f smoothedWristMid = cv::Point2f(-1, -1);
     cv::Point2f smoothedWristLeft = cv::Point2f(-1, -1);
@@ -379,10 +379,10 @@ struct HandGeometryState {
     int handValidityGraceCounter = 0;
     bool wasValidLastFrame = false;
     
-    // Smoothing buffers (independent)
-    std::deque<cv::Point2f> palmSmoothingBuffer;
-    std::deque<cv::Point2f> wristLeftSmoothingBuffer;
-    std::deque<cv::Point2f> wristRightSmoothingBuffer;
+    // Smoothing buffers - REMOVED (wrist smoothing moved to PalmEstimator)
+    // std::deque<cv::Point2f> palmSmoothingBuffer;  // REMOVED
+    // std::deque<cv::Point2f> wristLeftSmoothingBuffer;  // REMOVED
+    // std::deque<cv::Point2f> wristRightSmoothingBuffer;  // REMOVED
     
     // Fist detection
     std::vector<cv::Point> palmContour;
@@ -416,8 +416,11 @@ struct HandGeometryState {
     
     // Independent processing paths
     void updateRawGeometry(const cv::Point2f& palm, const std::vector<cv::Point>& contour);
-    void smoothPalmCenter();
-    void smoothWristGeometry();  // Smooths left and right independently
+    
+    // Smoothing functions - REMOVED (now in PalmEstimator)
+    // void smoothPalmCenter();  // REMOVED
+    // void smoothWristGeometry();  // REMOVED
+    
     void updateHandReferenceFrame();
     
     // Finger processing (hand-local only)

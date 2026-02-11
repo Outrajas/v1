@@ -83,6 +83,7 @@ cv::Point2f HandGeometryState::projectPointToContourInterior(const cv::Point2f& 
 }
 
 // STEP 1: Thumb & Pinky Base Extraction (FROM CONTOUR ONLY)
+// ITERATION 3: Enhanced with structural confidence biasing
 std::pair<cv::Point2f, cv::Point2f> HandGeometryState::findThumbPinkyBasesFromContour() {
     cv::Point2f foundThumbBase(-1, -1);
     cv::Point2f foundPinkyBase(-1, -1);
@@ -112,11 +113,13 @@ std::pair<cv::Point2f, cv::Point2f> HandGeometryState::findThumbPinkyBasesFromCo
     
     std::vector<cv::Point2f> candidates;
     std::vector<cv::Point2f> candidateGlobalPoints;
+    std::vector<float> candidateDistances; // ITERATION 3: Track distance for stability
     
     for (size_t i = 0; i < localPoints.size(); i++) {
         if (localPoints[i].y > baseMinY) {  // Below palm center in hand-local space
             candidates.push_back(localPoints[i]);
             candidateGlobalPoints.push_back(cv::Point2f(palmContour[i]));
+            candidateDistances.push_back(cv::norm(cv::Point2f(palmContour[i]) - palmCenter));
         }
     }
     
@@ -137,20 +140,49 @@ std::pair<cv::Point2f, cv::Point2f> HandGeometryState::findThumbPinkyBasesFromCo
         return {foundThumbBase, foundPinkyBase};
     }
     
-    // Find lateral extremes: thumb is MAX local.x, pinky is MIN local.x
+    // ITERATION 3: Enhanced base selection with distance filtering
+    // Find lateral extremes with distance-based filtering
     float maxLocalX = -std::numeric_limits<float>::max();
     float minLocalX = std::numeric_limits<float>::max();
     int thumbIdx = -1;
     int pinkyIdx = -1;
     
+    // Filter for reasonable distances (not too close, not too far)
     for (size_t i = 0; i < candidates.size(); i++) {
-        if (candidates[i].x > maxLocalX) {
-            maxLocalX = candidates[i].x;
-            thumbIdx = static_cast<int>(i);
+        float dist = candidateDistances[i];
+        // Valid base distance: between 0.8x and 1.5x palm radius
+        if (dist >= palmRadius * 0.8f && dist <= palmRadius * 1.5f) {
+            // Right side candidates (thumb in hand-local coordinates)
+            if (candidates[i].x > 0 && candidates[i].x > maxLocalX) {
+                maxLocalX = candidates[i].x;
+                thumbIdx = static_cast<int>(i);
+            }
+            // Left side candidates (pinky in hand-local coordinates)
+            if (candidates[i].x < 0 && candidates[i].x < minLocalX) {
+                minLocalX = candidates[i].x;
+                pinkyIdx = static_cast<int>(i);
+            }
         }
-        if (candidates[i].x < minLocalX) {
-            minLocalX = candidates[i].x;
-            pinkyIdx = static_cast<int>(i);
+    }
+    
+    // Fallback if filtered selection didn't find candidates
+    if (thumbIdx < 0) {
+        // Find maximum local.x (traditional method)
+        for (size_t i = 0; i < candidates.size(); i++) {
+            if (candidates[i].x > maxLocalX) {
+                maxLocalX = candidates[i].x;
+                thumbIdx = static_cast<int>(i);
+            }
+        }
+    }
+    
+    if (pinkyIdx < 0) {
+        // Find minimum local.x (traditional method)
+        for (size_t i = 0; i < candidates.size(); i++) {
+            if (candidates[i].x < minLocalX) {
+                minLocalX = candidates[i].x;
+                pinkyIdx = static_cast<int>(i);
+            }
         }
     }
     
@@ -569,9 +601,11 @@ void HandGeometryState::reset() {
     handValidityGraceCounter = 0;
     wasValidLastFrame = false;
     
-    palmSmoothingBuffer.clear();
-    wristLeftSmoothingBuffer.clear();
-    wristRightSmoothingBuffer.clear();
+    // Smoothing buffers removed - REMOVED
+    // palmSmoothingBuffer.clear();
+    // wristLeftSmoothingBuffer.clear();
+    // wristRightSmoothingBuffer.clear();
+    
     palmContour.clear();
     
     thumbBase = cv::Point2f(-1, -1);
@@ -613,100 +647,11 @@ void HandGeometryState::updateRawGeometry(const cv::Point2f& palm, const std::ve
     // We no longer compute wrist here
 }
 
-void HandGeometryState::smoothPalmCenter() {
-    if (rawPalmCenter.x < 0) return;
-    
-    // Maintain buffer
-    if (palmSmoothingBuffer.size() >= 5) {
-        palmSmoothingBuffer.pop_front();
-    }
-    palmSmoothingBuffer.push_back(rawPalmCenter);
-    
-    // Weighted average (more recent = higher weight)
-    cv::Point2f smoothed(0, 0);
-    float totalWeight = 0.0f;
-    
-    for (size_t i = 0; i < palmSmoothingBuffer.size(); i++) {
-        float weight = static_cast<float>(i + 1) / palmSmoothingBuffer.size();
-        smoothed += palmSmoothingBuffer[i] * weight;
-        totalWeight += weight;
-    }
-    
-    if (totalWeight > 0.0f) {
-        smoothedPalmCenter = smoothed * (1.0f / totalWeight);
-    } else {
-        smoothedPalmCenter = rawPalmCenter;
-    }
-    
-    // Ensure smoothed center is inside contour
-    smoothedPalmCenter = projectPointToContourInterior(smoothedPalmCenter, smoothedPalmCenter);
-    
-    // Apply to current
-    palmCenter = smoothedPalmCenter;
-}
+// Palm smoothing removed - REMOVED
+// void HandGeometryState::smoothPalmCenter() { ... }  // REMOVED
 
-void HandGeometryState::smoothWristGeometry() {
-    // ⚠️ Never smooth wristMid directly
-    // Smooth LEFT and RIGHT independently, then recompute MID
-    
-    if (wristLeft.x < 0 || wristRight.x < 0) return;
-    
-    // Smooth wrist left
-    if (wristLeftSmoothingBuffer.size() >= 5) {
-        wristLeftSmoothingBuffer.pop_front();
-    }
-    wristLeftSmoothingBuffer.push_back(wristLeft);
-    
-    cv::Point2f smoothedLeft(0, 0);
-    float totalWeightLeft = 0.0f;
-    
-    for (size_t i = 0; i < wristLeftSmoothingBuffer.size(); i++) {
-        float weight = static_cast<float>(i + 1) / wristLeftSmoothingBuffer.size();
-        smoothedLeft += wristLeftSmoothingBuffer[i] * weight;
-        totalWeightLeft += weight;
-    }
-    
-    if (totalWeightLeft > 0.0f) {
-        smoothedWristLeft = smoothedLeft * (1.0f / totalWeightLeft);
-    } else {
-        smoothedWristLeft = wristLeft;
-    }
-    
-    // Smooth wrist right
-    if (wristRightSmoothingBuffer.size() >= 5) {
-        wristRightSmoothingBuffer.pop_front();
-    }
-    wristRightSmoothingBuffer.push_back(wristRight);
-    
-    cv::Point2f smoothedRight(0, 0);
-    float totalWeightRight = 0.0f;
-    
-    for (size_t i = 0; i < wristRightSmoothingBuffer.size(); i++) {
-        float weight = static_cast<float>(i + 1) / wristRightSmoothingBuffer.size();
-        smoothedRight += wristRightSmoothingBuffer[i] * weight;
-        totalWeightRight += weight;
-    }
-    
-    if (totalWeightRight > 0.0f) {
-        smoothedWristRight = smoothedRight * (1.0f / totalWeightRight);
-    } else {
-        smoothedWristRight = wristRight;
-    }
-    
-    // Ensure smoothed points are inside contour
-    smoothedWristLeft = projectPointToContourInterior(smoothedWristLeft, smoothedWristLeft);
-    smoothedWristRight = projectPointToContourInterior(smoothedWristRight, smoothedWristRight);
-    
-    // Recompute wrist mid from smoothed left/right
-    if (smoothedWristLeft.x >= 0 && smoothedWristRight.x >= 0) {
-        smoothedWristMid = (smoothedWristLeft + smoothedWristRight) * 0.5f;
-    }
-    
-    // Update current state
-    wristLeft = smoothedWristLeft;
-    wristRight = smoothedWristRight;
-    wristMid = smoothedWristMid;
-}
+// Wrist smoothing removed - REMOVED
+// void HandGeometryState::smoothWristGeometry() { ... }  // REMOVED
 
 void HandGeometryState::updateHandReferenceFrame() {
     // DATA FLOW: Palm + Wrist → Hand Reference Frame
@@ -1079,6 +1024,7 @@ void HandGeometryState::updateValidity(bool newValid) {
 }
 
 // GeometryUpdater methods - CONSUMES AUTHORITATIVE wrist geometry
+// NO SMOOTHING - NOW PURE CONSUMER
 void GeometryUpdater::updateGeometry(const cv::Point2f& rawPalmCenter,
                                    const cv::Point2f& authoritativeWristMid,
                                    const cv::Point2f& authoritativeWristLeft,
@@ -1091,12 +1037,16 @@ void GeometryUpdater::updateGeometry(const cv::Point2f& rawPalmCenter,
     if (authoritativeWristLeft.x >= 0 && authoritativeWristRight.x >= 0) {
         currentState.wristLeft = authoritativeWristLeft;
         currentState.wristRight = authoritativeWristRight;
+        currentState.smoothedWristLeft = authoritativeWristLeft;
+        currentState.smoothedWristRight = authoritativeWristRight;
         
         if (authoritativeWristMid.x >= 0) {
             currentState.wristMid = authoritativeWristMid;
+            currentState.smoothedWristMid = authoritativeWristMid;
         } else {
             // Compute mid from left/right if not provided
             currentState.wristMid = (authoritativeWristLeft + authoritativeWristRight) * 0.5f;
+            currentState.smoothedWristMid = currentState.wristMid;
         }
         
         // Update last valid wrist
@@ -1104,6 +1054,10 @@ void GeometryUpdater::updateGeometry(const cv::Point2f& rawPalmCenter,
         currentState.lastValidWristRight = authoritativeWristRight;
         currentState.lastValidWristMid = currentState.wristMid;
     }
+    
+    // Palm center is already smoothed by PalmEstimator - just accept it
+    currentState.palmCenter = rawPalmCenter;
+    currentState.smoothedPalmCenter = rawPalmCenter;
     
     // Compute rotation angle for anti-drift (using authoritative wrist)
     float rotationAngle = 0.0f;
@@ -1125,15 +1079,19 @@ void GeometryUpdater::updateGeometry(const cv::Point2f& rawPalmCenter,
     // Apply anti-drift continuity
     currentState.applyTemporalContinuity(rawPalmCenter, lastPalmCenter, rotationAngle);
     
+    // ITERATION 3: Optional structural confidence modifier
+    // This is a placeholder - in practice would come from PalmEstimator
+    float structuralConfidenceModifier = 1.0f;
+    
     // Update last positions
     lastPalmCenter = rawPalmCenter;
     lastThumbBase = currentState.thumbBase;
     lastPinkyBase = currentState.pinkyBase;
     lastThumbPinkyWidth = currentState.lastValidThumbPinkyWidth;
     
-    // Independent smoothing paths (NO CROSS-DEPENDENCIES)
-    currentState.smoothPalmCenter();
-    currentState.smoothWristGeometry();  // Smooths authoritative left/right
+    // NO SMOOTHING HERE - REMOVED
+    // currentState.smoothPalmCenter();  // REMOVED
+    // currentState.smoothWristGeometry();  // REMOVED
     
     // Update hand reference frame (based on smoothed authoritative geometry)
     currentState.updateHandReferenceFrame();
@@ -1141,6 +1099,6 @@ void GeometryUpdater::updateGeometry(const cv::Point2f& rawPalmCenter,
     // Update finger tracking (in hand-local space only)
     currentState.updateFingerTracking();
     
-    // Update validity
-    currentState.updateValidity(!constrainedContour.empty());
+    // Update validity with optional structural confidence
+    currentState.updateValidity(!constrainedContour.empty() && structuralConfidenceModifier > 0.3f);
 }
