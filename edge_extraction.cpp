@@ -20,7 +20,7 @@ constexpr int DILATE_ITER = 1;      // number of passes
 constexpr int ERODE_SIZE  = 1;      // 0=off, 1=3x3, 2=5x5, 3=7x7
 constexpr int ERODE_ITER  = 1;
 constexpr int GAUSS_SIGMA = 1;      // 0=off, >0 applies blur (then re‑threshold)
-constexpr int GAUSS_KSIZE = 1;      // 1=3x3, 2=5x5 (only if GAUSS_SIGMA>0)
+constexpr int GAUSS_KSIZE = 2;      // 1=3x3, 2=5x5 (only if GAUSS_SIGMA>0)
 
 extern Mat globalReferenceVisual;
 extern Mat globalStructuralBarrier;

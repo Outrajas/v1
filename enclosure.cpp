@@ -1,4 +1,4 @@
-// enclosure.cpp – enclosure analysis, contour extraction, shape check
+// enclosure.cpp – enclosure analysis, contour extraction via Geodesic Leash & Shrink-Wrap
 #define NOMINMAX
 #include <opencv2/opencv.hpp>
 #include <vector>
@@ -152,7 +152,8 @@ EnclosureResult analyzeEnclosure(const vector<Point>& interiorCells,
 }
 
 vector<Point> extractOuterContour(const Mat& interiorMask, const Mat& barrierMap) {
-    Mat spatialMask = Mat::zeros(FRAME_HEIGHT, FRAME_WIDTH, CV_8UC1);
+    // 1. Map the low-res 4x4 Grid into a full-resolution Topological Core
+    Mat coreMass = Mat::zeros(FRAME_HEIGHT, FRAME_WIDTH, CV_8UC1);
     for (int r = 0; r <= GRID_ROWS; r++) {
         for (int c = 0; c <= GRID_COLS; c++) {
             if (interiorMask.at<uchar>(r,c) > 0) {
@@ -160,47 +161,53 @@ vector<Point> extractOuterContour(const Mat& interiorMask, const Mat& barrierMap
                 int y = min(r * CELL_H, FRAME_HEIGHT - 1);
                 int w = min(CELL_W, FRAME_WIDTH - x);
                 int h = min(CELL_H, FRAME_HEIGHT - y);
-                if (w > 0 && h > 0) spatialMask(Rect(x, y, w, h)).setTo(255);
+                if (w > 0 && h > 0) coreMass(Rect(x, y, w, h)).setTo(255);
             }
         }
     }
 
-    Mat dilated;
-    // Increased structuring element size slightly to ensure robust contour merging
-    dilate(spatialMask, dilated, getStructuringElement(MORPH_ELLIPSE, Size(5,5)));
+    // 2. THE GEODESIC LEASH: Create a strict boundary "Halo" around the topological data site
+    // We dilate the core by roughly 3 cells (12 pixels). This gives the edges just enough room 
+    // to be claimed if the BFS stopped early, but absolutely forbids runaway ROI expansion.
+    Mat leashMask;
+    dilate(coreMass, leashMask, getStructuringElement(MORPH_ELLIPSE, Size(CELL_W * 3, CELL_H * 3)));
 
-    vector<vector<Point>> contours;
-    findContours(dilated, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
-    if (contours.empty()) return {};
+    // 3. SEVER NOISE: Extract only the exact high-res Sobel edges physically inside the Leash.
+    // This cleanly chops off any background edges (like desks/windows) connected to the hand.
+    Mat tightlyBoundedEdges;
+    bitwise_and(barrierMap, leashMask, tightlyBoundedEdges);
 
+    // 4. Combine the solid BFS core with the bounded high-res edges.
+    // At this step, a small 1-cell gap exists between the core and the edge lines.
+    Mat highResShape;
+    bitwise_or(coreMass, tightlyBoundedEdges, highResShape);
+
+    // 5. SHRINK-WRAP SEALING: Morphological Close
+    // A closing operation (dilate then erode) fills the valleys (the gap between core and edges)
+    // WITHOUT expanding the outer perimeter. The high-res edges act as a rigid boundary wall.
+    // We use a kernel slightly larger than the gap (e.g., 9x9 pixels) to ensure total fusion.
+    morphologyEx(highResShape, highResShape, MORPH_CLOSE, getStructuringElement(MORPH_ELLIPSE, Size(CELL_W * 2 + 1, CELL_H * 2 + 1)));
+
+    // 6. Extract the final, tightly fitted, noise-free outer contour
+    vector<vector<Point>> finalContours;
+    findContours(highResShape, finalContours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+
+    if (finalContours.empty()) return {};
+
+    // Retrieve the largest bounding mass
     double maxArea = 0;
     int bestIdx = -1;
-    for (size_t i = 0; i < contours.size(); i++) {
-        double area = cv::contourArea(contours[i]);
+    for (size_t i = 0; i < finalContours.size(); i++) {
+        double area = cv::contourArea(finalContours[i]);
         if (area > maxArea) { maxArea = area; bestIdx = i; }
     }
+
     if (bestIdx < 0) return {};
 
-    vector<Point> rawContour = contours[bestIdx];
-    vector<Point> refined;
-    for (const auto& pt : rawContour) {
-        bool found = false;
-        for (int dy = -2; dy <= 2 && !found; dy++) {
-            for (int dx = -2; dx <= 2 && !found; dx++) {
-                int nx = pt.x + dx, ny = pt.y + dy;
-                if (nx >= 0 && nx < barrierMap.cols && ny >= 0 && ny < barrierMap.rows) {
-                    if (barrierMap.at<uchar>(ny, nx) != 0) {
-                        refined.push_back(Point(nx, ny));
-                        found = true;
-                    }
-                }
-            }
-        }
-        if (!found) refined.push_back(pt);
-    }
-
+    // Apply a 1.0 epsilon to gently smooth staircasing while retaining exact structural detail
     vector<Point> approx;
-    approxPolyDP(refined, approx, 2.0, true);
+    approxPolyDP(finalContours[bestIdx], approx, 1.0, true);
+    
     return approx;
 }
 
