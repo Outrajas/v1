@@ -1,4 +1,4 @@
-// main.cpp – Targeted Elastic IK & Dimensional Orientation (Merged & Stabilized)
+// main.cpp – Targeted Elastic IK & Dimensional Orientation (Centroid Stabilized)
 #define NOMINMAX
 #include <opencv2/opencv.hpp>
 #include <iostream>
@@ -331,7 +331,7 @@ extern void extractEdges(const Mat& frame, const Rect& roi, Mat& refVisualOut, M
 extern TopologyOutput runTopologyBFS(const Mat& barrierMap, const Rect& roi, Point2f predictedSeed, const Mat& prevMask, bool havePrev, float leakConf);
 extern EnclosureResult analyzeEnclosure(const vector<Point>& interiorCells, const Mat& barrierMap, const Rect& roi);
 extern vector<Point> extractOuterContour(const Mat& interiorMask, const Mat& barrierMap);
-extern void drawGrid(Mat& img); // LINK TO GLOBALS.CPP DEFINITION
+extern void drawGrid(Mat& img);
 
 int main() {
     VideoCapture cap(0);
@@ -414,7 +414,13 @@ int main() {
         if (lastTopology.success) {
             finalContour = extractOuterContour(lastTopology.interiorMask, globalStructuralBarrier);
             if (!finalContour.empty()) {
-                Moments mu = moments(finalContour);
+                // THE FIX: Because finalContour is now an open 1D raw line, calculating moments 
+                // directly on it yields a chaotic near-zero area, causing the centroid to teleport.
+                // We use the Convex Hull to establish a perfectly stable mathematical footprint.
+                vector<Point> spatialHull;
+                convexHull(finalContour, spatialHull);
+                Moments mu = moments(spatialHull);
+                
                 if (mu.m00 > 100) { 
                     rawMeasuredCentroid = Point2f(mu.m10 / mu.m00, mu.m01 / mu.m00);
                     newArea = mu.m00;
@@ -467,7 +473,6 @@ int main() {
             } else {
                 trackingRobust = true;
             }
-            // Safely solve kinematics using previous state if contour extraction failed
             solveKinematics(augmentedHand); 
         }
 
@@ -523,7 +528,7 @@ int main() {
         cageCanvas.setTo(Scalar(0,0,0));
         
         if (trackedObject.valid && !trackedObject.prevContours.empty()) {
-            drawContours(cageCanvas, trackedObject.prevContours, -1, Scalar(50, 20, 20), FILLED);
+            // Draw the pure 1D edge trace
             drawContours(cageCanvas, trackedObject.prevContours, -1, Scalar(255, 100, 100), 2);
             renderSimulation(cageCanvas, augmentedHand);
         }

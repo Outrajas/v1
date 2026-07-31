@@ -10,7 +10,7 @@ using namespace std;
 constexpr int FRAME_WIDTH = 640;
 constexpr int FRAME_HEIGHT = 480;
 constexpr int ROI_MARGIN = 15;
-constexpr double NOISE_FLOOR = 13.0;
+constexpr double NOISE_FLOOR = 15.0;
 constexpr int REQUIRED_VOTES = 5;
 constexpr int MIN_BLOB_AREA = 10;
 
